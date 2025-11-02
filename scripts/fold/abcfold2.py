@@ -80,6 +80,7 @@ runtime_image = (
             ),
         )
     )
+    .env({"PATH": f"{ABCFOLD_DIR}/.venv/bin:$PATH"})
     .workdir(ABCFOLD_DIR)
 )
 
@@ -185,7 +186,7 @@ def prepare_abcfold2(yaml_str: str, run_id: str) -> None:
                 conf_file=tmp_yaml_path,
                 out_dir=out_dir_full,
                 force=True,
-                template_cache_dir=f"{OUTPUTS_DIR}/.cache/rcsb",
+                template_cache_dir=Path(OUTPUTS_DIR) / ".cache" / "rcsb",
             )
 
     # Generate inputs for Boltz and Chai
