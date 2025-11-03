@@ -11,6 +11,7 @@ from modal import App, Image, Volume
 ##########################################
 # Modal configs
 # T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
+# https://modal.com/docs/guide/gpu
 GPU = os.environ.get("GPU", "A10G")
 TIMEOUT = int(os.environ.get("TIMEOUT", "1200"))  # seconds
 
@@ -55,7 +56,8 @@ runtime_image = (
     .env(
         {
             # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            "UV_TORCH_BACKEND": "auto",  # find best torch and CUDA versions
+            # https://modal.com/docs/guide/cuda
+            "UV_TORCH_BACKEND": "cu128",  # find best torch and CUDA versions
             "CHAI_DOWNLOADS_DIR": str(CHAI_MODEL_DIR),  # store chai model weights
             "BOLTZ_CACHE_DIR": str(BOLTZ_MODEL_DIR),  # store boltz model weights
         }
