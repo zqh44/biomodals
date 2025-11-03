@@ -142,6 +142,8 @@ async def download_chai_models(force=False):
         "models_v2/feature_embedding.pt",
         "models_v2/diffusion_module.pt",
         "models_v2/confidence_head.pt",
+        "models_v2/bond_loss_input_proj.pt",
+        "esm2/traced_sdpa_esm2_t36_3B_UR50D_fp16.pt",
     ]
 
     headers = {
@@ -161,6 +163,13 @@ async def download_chai_models(force=False):
 
         # run all of the downloads and await their completion
         await asyncio.gather(*tasks)
+
+    # Special treatment for ESM
+    esm2_path = chai_model_dir / "esm2" / "traced_sdpa_esm2_t36_3B_UR50D_fp16.pt"
+    esm_path = chai_model_dir / "esm" / "traced_sdpa_esm2_t36_3B_UR50D_fp16.pt"
+    if esm2_path.exists() and not esm_path.exists():
+        esm_path.parent.mkdir(parents=True, exist_ok=True)
+        esm_path.symlink_to(esm2_path)
 
     CHAI_VOLUME.commit()  # ensures models are visible on remote filesystem before exiting, otherwise takes a few seconds, racing with inference
 
@@ -182,6 +191,7 @@ def load_params_from_run_yaml(yaml_path: Path) -> dict:
 
 @app.function(
     image=runtime_image,
+    timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
 )
 def prepare_abcfold2(
@@ -244,11 +254,8 @@ def package_outputs(output_dir: str) -> bytes:
 @app.function(
     gpu=GPU,
     image=runtime_image,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        CHAI_MODEL_DIR: CHAI_VOLUME,
-        BOLTZ_MODEL_DIR: BOLTZ_VOLUME,
-    },
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
     max_containers=10,
 )
 def run_abcfold2_boltz(
@@ -258,7 +265,7 @@ def run_abcfold2_boltz(
     num_diffn_timesteps: int,  # sampling_steps
     num_diffn_samples: int,  # diffusion_samples
     boltz_additional_cli_args: list[str] | None,
-    **kwargs,
+    **kwargs,  # ignore extra items from run config
 ) -> bytes:
     """Run Boltz with the given ABCFold2 configuration."""
     from abcfold.boltz.run_boltz_abcfold import run_boltz
@@ -287,6 +294,51 @@ def run_abcfold2_boltz(
     return package_outputs(str(boltz_run_dir))
 
 
+@app.function(
+    gpu=GPU,
+    image=runtime_image,
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
+    max_containers=10,
+)
+def run_abcfold2_chai(
+    seed: int,
+    workdir: str | Path,
+    num_trunk_recycles: int,
+    num_diffn_timesteps: int,
+    num_diffn_samples: int,
+    num_trunk_samples: int,
+    **kwargs,  # ignore extra items from run config
+) -> bytes:
+    """Run Chai with the given ABCFold2 configuration."""
+    from abcfold.chai1.run_chai1_abcfold import run_chai
+
+    work_path = Path(workdir).expanduser().resolve()
+    run_id = work_path.stem
+    chai_work_path = work_path / f"chai_{run_id}"
+    chai_conf_path = chai_work_path / f"{run_id}.yaml"
+    if not chai_conf_path.exists():
+        raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
+
+    chai_run_dir = chai_work_path / f"chai_{run_id}_seed-{seed}"
+    if chai_run_dir.exists():
+        return package_outputs(str(chai_run_dir))
+
+    chai_run_dir = run_chai(
+        output_dir=chai_work_path,
+        chai_yaml_file=chai_conf_path,
+        seed=seed,
+        template_hits_path=work_path / "msa" / "all_chain_templates.m8",
+        template_cif_dir=work_path / "msa" / "templates",
+        num_trunk_recycles=num_trunk_recycles,
+        num_diffn_timesteps=num_diffn_timesteps,
+        num_diffn_samples=num_diffn_samples,
+        num_trunk_samples=num_trunk_samples,
+    )
+
+    return package_outputs(str(chai_run_dir))
+
+
 @app.local_entrypoint()
 def main(
     input_yaml: str,
@@ -298,7 +350,7 @@ def main(
 
     Args:
         input_yaml: Path to YAML design specification file
-        run_name: Optional run name (defaults to timestamp)
+        run_name: Optional run name (defaults to timestamp-{input file hash})
         download_models: Whether to download model weights before running
         force_redownload: Whether to force re-download of model weights
     """
@@ -322,9 +374,10 @@ def main(
         run_name = run_id[:8]  # short id
 
     local_out_dir = Path.cwd() / f"{today}-{run_name}"
-    local_out_dir.mkdir()
+    if local_out_dir.exists():
+        raise FileExistsError(f"Output directory already exists: {local_out_dir}")
 
-    print(f"🧬 Starting ABCFold2 run {run_name}...")
+    print(f"🧬 Starting ABCFold2 run {run_id}...")
     run_conf = prepare_abcfold2.remote(yaml_str=yaml_str, run_id=run_id)
 
     # Run Boltz for each seed
@@ -332,10 +385,22 @@ def main(
     for seed, boltz_res in zip(
         random_seeds, run_abcfold2_boltz.map(random_seeds, kwargs=run_conf), strict=True
     ):
-        out_path = local_out_dir / f"boltz_results_{run_id}_seed-{seed}.tar.gz"
+        out_path = (
+            local_out_dir
+            / f"boltz_{run_id}"
+            / f"boltz_results_{run_id}_seed-{seed}.tar.gz"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(boltz_res)
 
     # Run Chai for each seed
-    # TODO
+    for seed, chai_res in zip(
+        random_seeds, run_abcfold2_chai.map(random_seeds, kwargs=run_conf), strict=True
+    ):
+        out_path = (
+            local_out_dir / f"chai_{run_id}" / f"chai_{run_id}_seed-{seed}.tar.gz"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(chai_res)
 
     print(f"🧬 ABCFold2 run complete! Results saved to {local_out_dir}")
