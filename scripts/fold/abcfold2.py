@@ -29,7 +29,7 @@ from modal import App, Image, Volume
 # T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
 # https://modal.com/docs/guide/gpu
 GPU = os.environ.get("GPU", "A10G")
-TIMEOUT = int(os.environ.get("TIMEOUT", "1200"))  # seconds
+TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # seconds
 
 # Volume for model cache
 CHAI_VOLUME_NAME = "chai-models"
@@ -262,10 +262,42 @@ def package_outputs(output_dir: str) -> bytes:
 
     tar_buffer = io.BytesIO()
     out_path = Path(output_dir)
-    with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
+    with tarfile.open(fileobj=tar_buffer, mode="w:gz", compresslevel=6) as tar:
         tar.add(out_path, arcname=out_path.name)
 
     return tar_buffer.getvalue()
+
+
+@app.function(
+    cpu=1.0,
+    image=runtime_image,
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
+)
+def collect_abcfold2_boltz_data(
+    run_conf: dict[str, str | list[int] | int | list[str] | None],
+):
+    """Manage Boltz runs and return all Boltz results."""
+    from pathlib import Path
+
+    work_path = Path(run_conf["workdir"]).expanduser().resolve()
+    run_id = work_path.stem
+    work_path = work_path / f"boltz_{run_id}"
+    boltz_conf_path = work_path / f"{run_id}.yaml"
+    if not boltz_conf_path.exists():
+        raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
+
+    random_seeds = run_conf.get("seeds", [])
+    seeds_to_run = []
+    for seed in random_seeds:
+        boltz_run_dir = work_path / f"boltz_results_{run_id}_seed-{seed}"
+        if not boltz_run_dir.exists():
+            seeds_to_run.append(seed)
+
+    if seeds_to_run:
+        run_abcfold2_boltz.map(seeds_to_run, kwargs=run_conf)
+
+    return package_outputs(str(work_path))
 
 
 @app.function(
@@ -283,7 +315,7 @@ def run_abcfold2_boltz(
     num_diffn_samples: int,  # diffusion_samples
     boltz_additional_cli_args: list[str] | None,
     **kwargs,  # ignore extra items from run config
-) -> bytes:
+) -> str:
     """Run Boltz with the given ABCFold2 configuration."""
     from abcfold.boltz.run_boltz_abcfold import run_boltz
 
@@ -293,10 +325,6 @@ def run_abcfold2_boltz(
     boltz_conf_path = work_path / f"{run_id}.yaml"
     if not boltz_conf_path.exists():
         raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
-
-    boltz_run_dir = work_path / f"boltz_results_{run_id}_seed-{seed}"
-    if boltz_run_dir.exists():
-        return package_outputs(str(boltz_run_dir))
 
     boltz_run_dir = run_boltz(
         output_dir=work_path,
@@ -309,7 +337,39 @@ def run_abcfold2_boltz(
         boltz_additional_cli_args=boltz_additional_cli_args,
     )
     OUTPUTS_VOLUME.commit()
-    return package_outputs(str(boltz_run_dir))
+    return str(boltz_run_dir)
+
+
+@app.function(
+    cpu=1.0,
+    image=runtime_image,
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
+)
+def collect_abcfold2_chai_data(
+    run_conf: dict[str, str | list[int] | int | list[str] | None],
+):
+    """Manage Chai runs and return all Chai results."""
+    from pathlib import Path
+
+    work_path = Path(run_conf["workdir"]).expanduser().resolve()
+    run_id = work_path.stem
+    work_path = work_path / f"chai_{run_id}"
+    chai_conf_path = work_path / f"{run_id}.yaml"
+    if not chai_conf_path.exists():
+        raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
+
+    random_seeds = run_conf.get("seeds", [])
+    seeds_to_run = []
+    for seed in random_seeds:
+        chai_run_dir = work_path / f"chai_{run_id}_seed-{seed}"
+        if not chai_run_dir.exists():
+            seeds_to_run.append(seed)
+
+    if seeds_to_run:
+        run_abcfold2_chai.map(seeds_to_run, kwargs=run_conf)
+
+    return package_outputs(str(work_path))
 
 
 @app.function(
@@ -327,7 +387,7 @@ def run_abcfold2_chai(
     num_diffn_samples: int,
     num_trunk_samples: int,
     **kwargs,  # ignore extra items from run config
-) -> bytes:
+) -> str:
     """Run Chai with the given ABCFold2 configuration."""
     from abcfold.chai1.run_chai1_abcfold import run_chai
 
@@ -337,10 +397,6 @@ def run_abcfold2_chai(
     chai_conf_path = chai_work_path / f"{run_id}.yaml"
     if not chai_conf_path.exists():
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
-
-    chai_run_dir = chai_work_path / f"chai_{run_id}_seed-{seed}"
-    if chai_run_dir.exists():
-        return package_outputs(str(chai_run_dir))
 
     chai_run_dir = run_chai(
         output_dir=chai_work_path,
@@ -354,7 +410,7 @@ def run_abcfold2_chai(
         num_trunk_samples=num_trunk_samples,
     )
     OUTPUTS_VOLUME.commit()
-    return package_outputs(str(chai_run_dir))
+    return str(chai_run_dir)
 
 
 @app.local_entrypoint()
@@ -363,6 +419,8 @@ def main(
     run_name: str | None = None,
     download_models: bool = False,
     force_redownload: bool = False,
+    run_boltz: bool = True,
+    run_chai: bool = True,
 ) -> None:
     """Run ABCFold2 on modal and fetch results to $CWD.
 
@@ -371,6 +429,8 @@ def main(
         run_name: Optional run name (defaults to timestamp-{input file hash})
         download_models: Whether to download model weights before running
         force_redownload: Whether to force re-download of model weights
+        run_boltz: Whether to run Boltz inference
+        run_chai: Whether to run Chai inference
     """
     import hashlib
     from datetime import datetime
@@ -399,26 +459,19 @@ def main(
     run_conf = prepare_abcfold2.remote(yaml_str=yaml_str, run_id=run_id)
 
     # Run Boltz for each seed
-    random_seeds = run_conf.pop("seeds")
-    for seed, boltz_res in zip(
-        random_seeds, run_abcfold2_boltz.map(random_seeds, kwargs=run_conf), strict=True
-    ):
-        out_path = (
-            local_out_dir
-            / f"boltz_{run_id}"
-            / f"boltz_results_{run_id}_seed-{seed}.tar.gz"
-        )
+    if run_boltz:
+        out_path = local_out_dir / f"boltz_{run_id}.tar.gz"
+        print(f"🧬 Running Boltz and collecting results to {out_path}")
+        boltz_data = collect_abcfold2_boltz_data.remote(run_conf=run_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(boltz_res)
+        out_path.write_bytes(boltz_data)
 
     # Run Chai for each seed
-    for seed, chai_res in zip(
-        random_seeds, run_abcfold2_chai.map(random_seeds, kwargs=run_conf), strict=True
-    ):
-        out_path = (
-            local_out_dir / f"chai_{run_id}" / f"chai_{run_id}_seed-{seed}.tar.gz"
-        )
+    if run_chai:
+        out_path = local_out_dir / f"chai_{run_id}.tar.gz"
+        print(f"🧬 Running Chai and collecting results to {out_path}")
+        chai_data = collect_abcfold2_chai_data.remote(run_conf=run_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(chai_res)
+        out_path.write_bytes(chai_data)
 
     print(f"🧬 ABCFold2 run complete! Results saved to {local_out_dir}")

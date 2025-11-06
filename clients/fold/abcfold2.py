@@ -15,8 +15,12 @@ import modal
 download_boltz_models = modal.Function.from_name("ABCFold2", "download_boltz_models")
 download_chai_models = modal.Function.from_name("ABCFold2", "download_chai_models")
 prepare_abcfold2 = modal.Function.from_name("ABCFold2", "prepare_abcfold2")
-run_abcfold2_boltz = modal.Function.from_name("ABCFold2", "run_abcfold2_boltz")
-run_abcfold2_chai = modal.Function.from_name("ABCFold2", "run_abcfold2_chai")
+collect_abcfold2_boltz_data = modal.Function.from_name(
+    "ABCFold2", "collect_abcfold2_boltz_data"
+)
+collect_abcfold2_chai_data = modal.Function.from_name(
+    "ABCFold2", "collect_abcfold2_chai_data"
+)
 
 
 def run_abcfold2(
@@ -24,6 +28,8 @@ def run_abcfold2(
     run_name: str | None = None,
     download_models: bool = False,
     force_redownload: bool = False,
+    run_boltz: bool = True,
+    run_chai: bool = True,
 ) -> None:
     """Run ABCFold2 on modal and fetch results to $CWD.
 
@@ -32,6 +38,8 @@ def run_abcfold2(
         run_name: Optional run name (defaults to timestamp-{input file hash})
         download_models: Whether to download model weights before running
         force_redownload: Whether to force re-download of model weights
+        run_boltz: Whether to run Boltz inference
+        run_chai: Whether to run Chai inference
     """
     if download_models:
         print("🧬 Checking Boltz inference dependencies...")
@@ -57,26 +65,19 @@ def run_abcfold2(
     run_conf = prepare_abcfold2.remote(yaml_str=yaml_str, run_id=run_id)
 
     # Run Boltz for each seed
-    random_seeds = run_conf.pop("seeds")
-    for seed, boltz_res in zip(
-        random_seeds, run_abcfold2_boltz.map(random_seeds, kwargs=run_conf), strict=True
-    ):
-        out_path = (
-            local_out_dir
-            / f"boltz_{run_id}"
-            / f"boltz_results_{run_id}_seed-{seed}.tar.gz"
-        )
+    if run_boltz:
+        out_path = local_out_dir / f"boltz_{run_id}.tar.gz"
+        print(f"🧬 Running Boltz and collecting results to {out_path}")
+        boltz_data = collect_abcfold2_boltz_data.remote(run_conf=run_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(boltz_res)
+        out_path.write_bytes(boltz_data)
 
     # Run Chai for each seed
-    for seed, chai_res in zip(
-        random_seeds, run_abcfold2_chai.map(random_seeds, kwargs=run_conf), strict=True
-    ):
-        out_path = (
-            local_out_dir / f"chai_{run_id}" / f"chai_{run_id}_seed-{seed}.tar.gz"
-        )
+    if run_chai:
+        out_path = local_out_dir / f"chai_{run_id}.tar.gz"
+        print(f"🧬 Running Chai and collecting results to {out_path}")
+        chai_data = collect_abcfold2_chai_data.remote(run_conf=run_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(chai_res)
+        out_path.write_bytes(chai_data)
 
     print(f"🧬 ABCFold2 run complete! Results saved to {local_out_dir}")
