@@ -9,6 +9,8 @@ from pathlib import Path
 from modal import App, Image, Volume
 
 ##########################################
+# Modal configs
+##########################################
 # https://modal.com/docs/guide/gpu
 GPU = os.environ.get("GPU", "L40S")
 TIMEOUT = int(os.environ.get("TIMEOUT", "1200"))  # for inputs and startup in seconds
@@ -29,7 +31,8 @@ BOLTZGEN_COMMIT = "6a82850a6e8f8b334d8202822395f95725c02904"
 BOLTZGEN_REPO_DIR = "/opt/boltzgen"
 
 ##########################################
-
+# Image and app definitions
+##########################################
 runtime_image = (
     Image.debian_slim()
     .apt_install("git", "build-essential", "wget")
@@ -60,6 +63,9 @@ runtime_image = (
 app = App("BoltzGen", image=runtime_image)
 
 
+##########################################
+# Helper functions
+##########################################
 def package_outputs(output_dir: str) -> bytes:
     """Package output directory into a tar.gz archive and return as bytes."""
     import io
@@ -74,6 +80,99 @@ def package_outputs(output_dir: str) -> bytes:
     return tar_buffer.getvalue()
 
 
+class YAMLReferenceLoader:
+    """Class to load referenced files from YAML files.
+
+    BoltzGen configs might reference other cif or yaml files.
+    We need to recursively parse all yaml files to find all used cif templates.
+
+    The file paths need to be relative to the parent directory of the
+    input yaml, because we need to recreate the file structure on the remote.
+    """
+
+    def __init__(self, input_yaml_file: str | Path) -> None:
+        """Initialize the loader with the input YAML file path."""
+        self.input_path = Path(input_yaml_file).expanduser().resolve()
+        self.ref_dir = self.input_path.parent
+
+        # key: relative path to self.ref_dir, value: file content bytes
+        self.additional_files: dict[str, bytes] = {}
+
+        # absolute paths for tracking and recursive parsing
+        self.parsed_files: set[Path] = set()
+        self.queue: set[Path] = set()
+        self.queue.add(self.input_path)
+        self.load()
+
+    def load(self) -> None:
+        """Load referenced files from a YAML."""
+        while self.queue:
+            file = self.queue.pop()
+            if file in self.parsed_files:
+                continue
+
+            new_ref_files = self.find_paths_from_yaml(file)
+            for ref_file in new_ref_files:
+                ref_path = file.parent.joinpath(ref_file).resolve()
+                if ref_path.exists():
+                    rel_path = ref_path.relative_to(self.ref_dir, walk_up=True)
+                    self.additional_files[str(rel_path)] = ref_path.read_bytes()
+                if (
+                    ref_path.suffix in {".yaml", ".yml"}
+                    and ref_path not in self.parsed_files
+                ):
+                    self.queue.add(ref_path)
+
+    def find_paths_from_yaml(self, yaml_file: Path) -> set[Path]:
+        """Load referenced files from a YAML."""
+        import yaml
+
+        yaml_path = Path(yaml_file).expanduser().resolve()
+        if yaml_path in self.parsed_files:
+            return set()
+
+        with yaml_path.open() as f:
+            conf = yaml.safe_load(f)
+
+        file_refs: set[Path] = set()
+        self.find_paths_in_dict(conf, yaml_path.parent, file_refs)
+        self.parsed_files.add(yaml_path)
+        return file_refs
+
+    def find_paths_in_dict(
+        self, yaml_content: dict, ref_dir: Path, file_refs: set[Path]
+    ) -> None:
+        """Recursively find all file references in the yaml content."""
+        for v in yaml_content.values():
+            if isinstance(v, str):
+                if (p := (ref_dir / v)).exists():
+                    file_refs.add(p)
+            elif isinstance(v, list):
+                self.find_paths_in_list(v, ref_dir, file_refs)
+            elif isinstance(v, dict):
+                self.find_paths_in_dict(v, ref_dir, file_refs)
+            else:
+                continue
+
+    def find_paths_in_list(
+        self, sublist: list, ref_dir: Path, file_refs: set[Path]
+    ) -> None:
+        """Recursively find all file references in the yaml content."""
+        for item in sublist:
+            if isinstance(item, str):
+                if (p := (ref_dir / item)).exists():
+                    file_refs.add(p)
+            elif isinstance(item, dict):
+                self.find_paths_in_dict(item, ref_dir, file_refs)
+            elif isinstance(item, list):
+                self.find_paths_in_list(item, ref_dir, file_refs)
+            else:
+                continue
+
+
+##########################################
+# Fetch model weights
+##########################################
 @app.function(
     volumes={BOLTZGEN_MODEL_DIR: BOLTZGEN_VOLUME}, timeout=TIMEOUT, image=runtime_image
 )
@@ -94,6 +193,9 @@ def boltzgen_download(force: bool = False) -> None:
     BOLTZGEN_VOLUME.commit()
 
 
+##########################################
+# Inference functions
+##########################################
 @app.function(
     timeout=TIMEOUT, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME}, image=runtime_image
 )
@@ -234,96 +336,10 @@ def boltzgen_run(
     return str(out_dir)
 
 
-class YAMLReferenceLoader:
-    """Class to load referenced files from YAML files.
-
-    BoltzGen configs might reference other cif or yaml files.
-    We need to recursively parse all yaml files to find all used cif templates.
-
-    The file paths need to be relative to the parent directory of the
-    input yaml, because we need to recreate the file structure on the remote.
-    """
-
-    def __init__(self, input_yaml_file: str | Path) -> None:
-        """Initialize the loader with the input YAML file path."""
-        self.input_path = Path(input_yaml_file).expanduser().resolve()
-        self.ref_dir = self.input_path.parent
-
-        # key: relative path to self.ref_dir, value: file content bytes
-        self.additional_files: dict[str, bytes] = {}
-
-        # absolute paths for tracking and recursive parsing
-        self.parsed_files: set[Path] = set()
-        self.queue: set[Path] = set()
-        self.queue.add(self.input_path)
-        self.load()
-
-    def load(self) -> None:
-        """Load referenced files from a YAML."""
-        while self.queue:
-            file = self.queue.pop()
-            if file in self.parsed_files:
-                continue
-
-            new_ref_files = self.find_paths_from_yaml(file)
-            for ref_file in new_ref_files:
-                ref_path = file.parent.joinpath(ref_file).resolve()
-                if ref_path.exists():
-                    rel_path = ref_path.relative_to(self.ref_dir, walk_up=True)
-                    self.additional_files[str(rel_path)] = ref_path.read_bytes()
-                if (
-                    ref_path.suffix in {".yaml", ".yml"}
-                    and ref_path not in self.parsed_files
-                ):
-                    self.queue.add(ref_path)
-
-    def find_paths_from_yaml(self, yaml_file: Path) -> set[Path]:
-        """Load referenced files from a YAML."""
-        import yaml
-
-        yaml_path = Path(yaml_file).expanduser().resolve()
-        if yaml_path in self.parsed_files:
-            return set()
-
-        with yaml_path.open() as f:
-            conf = yaml.safe_load(f)
-
-        file_refs: set[Path] = set()
-        self.find_paths_in_dict(conf, yaml_path.parent, file_refs)
-        self.parsed_files.add(yaml_path)
-        return file_refs
-
-    def find_paths_in_dict(
-        self, yaml_content: dict, ref_dir: Path, file_refs: set[Path]
-    ) -> None:
-        """Recursively find all file references in the yaml content."""
-        for v in yaml_content.values():
-            if isinstance(v, str):
-                if (p := (ref_dir / v)).exists():
-                    file_refs.add(p)
-            elif isinstance(v, list):
-                self.find_paths_in_list(v, ref_dir, file_refs)
-            elif isinstance(v, dict):
-                self.find_paths_in_dict(v, ref_dir, file_refs)
-            else:
-                continue
-
-    def find_paths_in_list(
-        self, sublist: list, ref_dir: Path, file_refs: set[Path]
-    ) -> None:
-        """Recursively find all file references in the yaml content."""
-        for item in sublist:
-            if isinstance(item, str):
-                if (p := (ref_dir / item)).exists():
-                    file_refs.add(p)
-            elif isinstance(item, dict):
-                self.find_paths_in_dict(item, ref_dir, file_refs)
-            elif isinstance(item, list):
-                self.find_paths_in_list(item, ref_dir, file_refs)
-            else:
-                continue
-
-
+##########################################
+# Entrypoint for ephemeral usage
+##########################################
+@app.local_entrypoint()
 def submit_boltzgen_task(
     input_yaml: str,
     out_dir: str | None = None,
@@ -391,6 +407,3 @@ def submit_boltzgen_task(
     (local_out_dir / f"{run_name}.tar.gz").write_bytes(outputs)
 
     print(f"Results saved to: {local_out_dir}")
-
-
-main = app.local_entrypoint()(submit_boltzgen_task)
