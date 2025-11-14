@@ -14,6 +14,7 @@ from modal import App, Image, Volume
 # https://modal.com/docs/guide/gpu
 GPU = os.environ.get("GPU", "L40S")
 TIMEOUT = int(os.environ.get("TIMEOUT", "1200"))  # for inputs and startup in seconds
+APP_NAME = os.environ.get("MODAL_APP", "BoltzGen")
 
 # Volume for model cache
 BOLTZGEN_VOLUME_NAME = "boltzgen-models"
@@ -27,7 +28,7 @@ OUTPUTS_DIR = "/boltzgen-outputs"
 
 # Repositories and commit hashes
 BOLTZGEN_REPO = "https://github.com/HannesStark/boltzgen"
-BOLTZGEN_COMMIT = "6a82850a6e8f8b334d8202822395f95725c02904"
+BOLTZGEN_COMMIT = "f490b204e70360354b6afcda6a2edec8d7895383"
 BOLTZGEN_REPO_DIR = "/opt/boltzgen"
 
 ##########################################
@@ -60,7 +61,7 @@ runtime_image = (
     .workdir(BOLTZGEN_REPO_DIR)
 )
 
-app = App("BoltzGen", image=runtime_image)
+app = App(APP_NAME, image=runtime_image)
 
 
 ##########################################
@@ -70,6 +71,7 @@ def package_outputs(
     root: str | Path,
     paths_to_bundle: Iterable[str | Path],
     tar_args: list[str] | None = None,
+    num_threads: int = 16,
 ) -> bytes:
     """Package directories into a tar.zst archive and return as bytes.
 
@@ -80,6 +82,7 @@ def package_outputs(
         root: Root directory in the archive. All paths will be relative to this.
         paths_to_bundle: Specific paths (relative to root) to include in the archive.
         tar_args: Additional arguments to pass to `tar`.
+        num_threads: Number of threads to use for compression.
     """
     import subprocess as sp
     from pathlib import Path
@@ -99,8 +102,9 @@ def package_outputs(
         else:
             print(f"Warning: path {out_path} does not exist and will be skipped.")
 
-    result = sp.run(cmd, capture_output=True, check=True, cwd=root_path.parent)  # noqa: S603
-    return result.stdout
+    return sp.check_output(
+        cmd, cwd=root_path.parent, env={"ZSTD_NBTHREADS": str(num_threads)}
+    )  # noqa: S603
 
 
 class YAMLReferenceLoader:
@@ -243,7 +247,10 @@ def prepare_boltzgen_run(
 
 
 @app.function(
-    cpu=1.0, timeout=86400, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME}, image=runtime_image
+    cpu=(0.125, 16.125),  # burst for tar compression
+    timeout=86400,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    image=runtime_image,
 )
 def collect_boltzgen_data(
     run_name: str,

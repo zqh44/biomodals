@@ -30,6 +30,7 @@ from modal import App, Image, Volume
 # https://modal.com/docs/guide/gpu
 GPU = os.environ.get("GPU", "A10G")
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # seconds
+APP_NAME = os.environ.get("MODAL_APP", "ABCFold2")
 
 # Volume for model cache
 CHAI_VOLUME_NAME = "chai-models"
@@ -108,13 +109,15 @@ runtime_image = (
     .workdir(ABCFOLD_DIR)
 )
 
-app = App("ABCFold2", image=runtime_image)
+app = App(APP_NAME, image=runtime_image)
 
 
 ##########################################
 # Helper functions
 ##########################################
-def package_outputs(dir: str, tar_args: list[str] | None = None) -> bytes:
+def package_outputs(
+    dir: str, tar_args: list[str] | None = None, num_threads: int = 16
+) -> bytes:
     """Package directory into a tar.zst archive and return as bytes."""
     import subprocess as sp
     from pathlib import Path
@@ -125,8 +128,9 @@ def package_outputs(dir: str, tar_args: list[str] | None = None) -> bytes:
         cmd.extend(tar_args)
     cmd.extend(["-cf", "-", dir_path.name])
 
-    result = sp.run(cmd, capture_output=True, check=True, cwd=dir_path.parent)  # noqa: S603
-    return result.stdout
+    return sp.check_output(
+        cmd, cwd=dir_path.parent, env={"ZSTD_NBTHREADS": str(num_threads)}
+    )  # noqa: S603
 
 
 ##########################################
@@ -304,7 +308,7 @@ def prepare_abcfold2(
 
 
 @app.function(
-    cpu=1.0,
+    cpu=(0.125, 16.125),  # burst for tar compression
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
@@ -394,7 +398,7 @@ def run_abcfold2_boltz(
 
 
 @app.function(
-    cpu=1.0,
+    cpu=(0.125, 16.125),  # burst for tar compression
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
