@@ -51,7 +51,7 @@ OUTPUTS_DIR = "/abcfold2-outputs"
 # Repositories and commit hashes
 ABCFOLD_DIR = "/opt/ABCFold"
 ABCFOLD_REPO = "https://github.com/y1zhou/ABCFold"
-ABCFOLD_COMMIT = "9c3b5fe9d19598c83f46875e846eb7c9930fc3cb"
+ABCFOLD_COMMIT = "3fe7da2cb1ac4ec822535f843066805bf9018817"
 
 CHAI_DIR = "/opt/chai-lab"
 CHAI_REPO = "https://github.com/y1zhou/chai-lab"
@@ -263,7 +263,7 @@ def get_run_id(yaml_str: bytes) -> str:
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
 )
 def prepare_abcfold2(
-    yaml_str: bytes,
+    yaml_str: bytes, search_templates: bool
 ) -> dict[str, str | list[int] | int | list[str] | None]:
     """Prepare inputs to Boltz and Chai using ABCFold2 config."""
     import tempfile
@@ -272,6 +272,8 @@ def prepare_abcfold2(
     from abcfold.cli.prepare import prepare_boltz, prepare_chai, search_msa
 
     run_id: str = get_run_id.local(yaml_str=yaml_str)
+    if not search_templates:
+        run_id = f"{run_id}-no-tmpl"
     out_dir_full: Path = Path(OUTPUTS_DIR) / run_id[:2] / run_id
     out_dir_full.mkdir(parents=True, exist_ok=True)
 
@@ -288,6 +290,7 @@ def prepare_abcfold2(
                 conf_file=tmp_yaml_path,
                 out_dir=out_dir_full,
                 force=True,
+                search_templates=search_templates,
                 template_cache_dir=Path(OUTPUTS_DIR) / ".cache" / "rcsb",
             )
             OUTPUTS_VOLUME.commit()
@@ -470,11 +473,14 @@ def run_abcfold2_chai(
     if not chai_conf_path.exists():
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
 
+    template_hits_path = work_path / "msa" / "all_chain_templates.m8"
+    if not template_hits_path.exists():
+        template_hits_path = None
     chai_run_dir = run_chai(
         output_dir=chai_work_path,
         chai_yaml_file=chai_conf_path,
         seed=seed,
-        template_hits_path=work_path / "msa" / "all_chain_templates.m8",
+        template_hits_path=template_hits_path,
         template_cif_dir=work_path / "msa" / "templates",
         num_trunk_recycles=num_trunk_recycles,
         num_diffn_timesteps=num_diffn_timesteps,
@@ -493,6 +499,7 @@ def submit_abcfold2_task(
     input_yaml: str,
     out_dir: str | None = None,
     run_name: str | None = None,
+    search_templates: bool = True,
     download_models: bool = False,
     force_redownload: bool = False,
     run_boltz: bool = True,
@@ -500,10 +507,14 @@ def submit_abcfold2_task(
 ) -> None:
     """Run ABCFold2 on modal and fetch results to `out_dir`.
 
+    Note that MSAs will be searched automatically. Templates will be searched only if
+    `search_templates` is True.
+
     Args:
         input_yaml: Path to YAML design specification file
         out_dir: Optional output directory (defaults to $CWD)
         run_name: Optional run name (defaults to {input filename stem})
+        search_templates: Whether to search for templates and add to input YAML
         download_models: Whether to download model weights before running
         force_redownload: Whether to force re-download of model weights
         run_boltz: Whether to run Boltz inference
@@ -518,6 +529,8 @@ def submit_abcfold2_task(
 
     if run_name is None:
         run_name = yaml_path.stem
+    if not search_templates:
+        run_name = f"{run_name}-no-tmpl"
 
     if out_dir is None:
         out_dir = Path.cwd()
@@ -526,7 +539,9 @@ def submit_abcfold2_task(
         raise FileExistsError(f"Output directory already exists: {local_out_dir}")
 
     print("🧬 Starting ABCFold2 run...")
-    run_conf = prepare_abcfold2.remote(yaml_str=yaml_str)
+    run_conf = prepare_abcfold2.remote(
+        yaml_str=yaml_str, search_templates=search_templates
+    )
     local_out_dir.mkdir(parents=True, exist_ok=True)
     with open(local_out_dir / "run-config.json", "w") as f:
         json.dump(run_conf, f, indent=2)
