@@ -170,6 +170,59 @@ def abnativ_score_unpaired(
     return tarball_bytes
 
 
+@app.function(
+    gpu=GPU,
+    cpu=(1.125, 16.125),  # burst for tar compression
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    image=runtime_image,
+    timeout=TIMEOUT,
+    volumes={ABNATIV_MODEL_DIR: ABNATIV_VOLUME.read_only()},
+)
+def abnativ_score_paired(
+    csv_bytes: bytes,
+    output_id: str,
+    mean_score_only: bool,
+    align_before_scoring: bool,
+    ncpu: int,
+    plot_profiles: bool,
+):
+    """Manage AbNatiV runs and return all score results."""
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as tmpdir:
+        work_path = Path(tmpdir) / output_id
+        work_path.mkdir()
+        input_csv = work_path.parent / f"{output_id}.csv"
+        with open(input_csv, "wb") as f:
+            f.write(csv_bytes)
+        cmd = [
+            "abnativ",
+            "paired_score",
+            "-i",
+            str(input_csv),
+            "-odir",
+            str(work_path),
+            "--output_id",
+            output_id,
+            "--ncpu",
+            str(ncpu),
+        ]
+        if mean_score_only:
+            cmd.append("--mean_score_only")
+        if align_before_scoring:
+            cmd.append("--do_align")
+        if plot_profiles:
+            cmd.append("-plot")
+
+        run_command(cmd)
+
+        print("Packaging results...")
+        tarball_bytes = package_outputs(str(work_path))
+        print("Packaging complete.")
+
+    return tarball_bytes
+
+
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
@@ -188,10 +241,10 @@ def submit_abnativ_task(
     # AbNatiV configs
     model_type: str = "VH",
     mean_score_only: bool = False,
-    align_before_scoring: bool = False,
+    align_before_scoring: bool = True,
     num_workers: int = 1,
     is_vhh: bool = False,
-    plot_profiles: bool = False,
+    plot_profiles: bool = True,
 ) -> None:
     """Run AbNatiV scoring on modal and fetch results to `out_dir`.
 
@@ -236,8 +289,42 @@ def submit_abnativ_task(
     # Submit scoring job based on model type
     match model_type:
         case "paired":
-            raise NotImplementedError(
-                "Paired AbNatiV model not yet implemented in this Modal app."
+            if input_paired_csv is None and (
+                input_vh_seq is None or input_vl_seq is None
+            ):
+                raise ValueError(
+                    "For paired model_type, either input_paired_csv or both "
+                    "input_vh_seq and input_vl_seq must be provided."
+                )
+            if input_paired_csv is not None:
+                input_path = Path(input_paired_csv)
+                if not input_path.exists():
+                    raise FileNotFoundError(
+                        f"Input paired CSV file not found: {input_paired_csv}"
+                    )
+                with open(input_path, "rb") as f:
+                    csv_bytes = f.read()
+            elif input_vh_seq is not None and input_vl_seq is not None:
+                # Build CSV from single-sequence inputs
+                if "\n" in input_vh_seq or " " in input_vh_seq:
+                    raise ValueError(
+                        "Input VH sequence does not appear to be a valid single sequence."
+                    )
+                if "\n" in input_vl_seq or " " in input_vl_seq:
+                    raise ValueError(
+                        "Input VL sequence does not appear to be a valid single sequence."
+                    )
+                csv_str = f"ID,vh_seq,vl_seq\nsingle_seq,{input_vh_seq.strip()},{input_vl_seq.strip()}\n"
+                csv_bytes = csv_str.encode("utf-8")
+
+            print("🧬 Running AbNatiV paired mode...")
+            abnativ_scores = abnativ_score_paired.remote(
+                csv_bytes=csv_bytes,
+                output_id=run_name,
+                mean_score_only=mean_score_only,
+                align_before_scoring=align_before_scoring,
+                ncpu=num_workers,
+                plot_profiles=plot_profiles,
             )
         case "VH" | "VKappa" | "VLambda" | "VHH" | "VH2" | "VL2" | "VHH2":
             # Load fasta, or build one if it is not a file path
