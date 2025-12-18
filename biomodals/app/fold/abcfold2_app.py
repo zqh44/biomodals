@@ -7,6 +7,7 @@
 | `--input-yaml` | **Required** | Path to YAML design specification file. For a detailed description of the YAML schema, see https://github.com/y1zhou/ABCFold/blob/feat/schema/abcfold/schema.py. |
 | `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in the current working directory. |
 | `--run-name` | stem name of `--input-yaml` | Optional run name used to name output directory. |
+| `--msa-chains` | None (all chains) | Optional comma-separated list of chains to search MSAs for. If not specified, MSAs will be searched for all chains. To skip MSA searches entirely, pass 'empty'. |
 | `--search-templates`/`--no-search-templates` | `--search-templates` | Whether to search for templates and add to input YAML. |
 | `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and skip running. |
 | `--force-redownload` | `--no-force-redownload` | Whether to force re-download of model weights even if they exist. |
@@ -67,7 +68,7 @@ OUTPUTS_DIR = "/abcfold2-outputs"
 # Repositories and commit hashes
 ABCFOLD_DIR = "/opt/ABCFold"
 ABCFOLD_REPO = "https://github.com/y1zhou/ABCFold"
-ABCFOLD_COMMIT = "3fe7da2cb1ac4ec822535f843066805bf9018817"
+ABCFOLD_COMMIT = "259235c3fe5773bab7a1a806ed2ca18c4f8ff121"
 
 CHAI_DIR = "/opt/chai-lab"
 CHAI_REPO = "https://github.com/y1zhou/chai-lab"
@@ -279,7 +280,7 @@ def get_run_id(yaml_str: bytes) -> str:
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
 )
 def prepare_abcfold2(
-    yaml_str: bytes, search_templates: bool
+    yaml_str: bytes, search_templates: bool, msa_chains: str | None = None
 ) -> dict[str, str | list[int] | int | list[str] | None]:
     """Prepare inputs to Boltz and Chai using ABCFold2 config."""
     import tempfile
@@ -306,6 +307,7 @@ def prepare_abcfold2(
                 conf_file=tmp_yaml_path,
                 out_dir=out_dir_full,
                 force=True,
+                chains=msa_chains,
                 search_templates=search_templates,
                 template_cache_dir=Path(OUTPUTS_DIR) / ".cache" / "rcsb",
             )
@@ -515,6 +517,7 @@ def submit_abcfold2_task(
     input_yaml: str,
     out_dir: str | None = None,
     run_name: str | None = None,
+    msa_chains: str | None = None,
     search_templates: bool = True,
     download_models: bool = False,
     force_redownload: bool = False,
@@ -530,6 +533,7 @@ def submit_abcfold2_task(
         input_yaml: Path to YAML design specification file
         out_dir: Optional output directory (defaults to $CWD)
         run_name: Optional run name (defaults to {input filename stem})
+        msa_chains: Optional comma-separated list of chains to search MSAs for (defaults to all chains)
         search_templates: Whether to search for templates and add to input YAML
         download_models: Whether to download model weights before running
         force_redownload: Whether to force re-download of model weights
@@ -556,7 +560,7 @@ def submit_abcfold2_task(
 
     print("🧬 Starting ABCFold2 run...")
     run_conf = prepare_abcfold2.remote(
-        yaml_str=yaml_str, search_templates=search_templates
+        yaml_str=yaml_str, search_templates=search_templates, msa_chains=msa_chains
     )
     local_out_dir.mkdir(parents=True, exist_ok=True)
     with open(local_out_dir / "run-config.json", "w") as f:
