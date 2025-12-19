@@ -25,6 +25,9 @@ def callback():
     """
 
 
+##########################################
+# Helper Functions
+##########################################
 def get_all_apps(use_absolute_paths: bool = False) -> dict[str, Path]:
     """Retrieve all available biomodals applications."""
     available_apps: dict[str, Path] = {}
@@ -40,6 +43,46 @@ def get_all_apps(use_absolute_paths: bool = False) -> dict[str, Path]:
     return available_apps
 
 
+def app_path_to_module_path(app_path: Path) -> str:
+    """Convert an app path to a module path."""
+    module_path = (
+        str(app_path.resolve().relative_to(APP_HOME))
+        .replace("/", ".")
+        .replace("\\", ".")
+        .replace(".py", "")
+        .replace("-", "_")
+    )
+    return f"biomodals.app.{module_path}"
+
+
+def _run_command(cmd: list[str], **kwargs) -> None:
+    """Run a shell command and stream output to stdout."""
+    import os
+    import subprocess as sp
+
+    console.print(f"Running command: {' '.join(cmd)}")
+    # Set default kwargs for sp.Popen
+    kwargs.setdefault("stdout", sp.PIPE)
+    kwargs.setdefault("stderr", sp.STDOUT)
+    kwargs.setdefault("bufsize", 1)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("env", os.environ | {"SYSTEMD_COLORS": "1"})
+
+    with sp.Popen(cmd, **kwargs) as p:
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        buffered_output = None
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+            console.print(buffered_output, end="")
+
+        if p.returncode != 0:
+            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+
+
+##########################################
+# CLI Commands
+##########################################
 @app.command(name="list")
 def list_available_apps(
     use_absolute_paths: Annotated[
@@ -76,7 +119,12 @@ def show_app_help(
     ],
 ):
     """Show help for a specific biomodals application."""
+    import modal
+
     all_apps = get_all_apps(use_absolute_paths=True)
+    app_name, entrypoint_name = (
+        app_name.split("::") if "::" in app_name else (app_name, None)
+    )
     if app_name in all_apps:
         app_path = all_apps[app_name]
     else:
@@ -87,20 +135,32 @@ def show_app_help(
             )
             raise typer.Exit(code=1)
 
-    module_path = (
-        str(app_path.relative_to(APP_HOME))
-        .replace("/", ".")
-        .replace("\\", ".")
-        .replace(".py", "")
-        .replace("-", "_")
-    )
-    module_path = f"biomodals.app.{module_path}"
+    module_path = app_path_to_module_path(app_path)
     try:
         module = importlib.import_module(module_path)
+
+        remote_modal_functions: list[str] = []
+        for obj in dir(module):
+            f = getattr(module, obj)
+            if isinstance(f, modal.Function):
+                if entrypoint_name is not None and obj == entrypoint_name:
+                    console.print(
+                        f"[bold]Docstring for entrypoint function '[green]{entrypoint_name}[/green]':[/bold]\n"
+                    )
+                    console.print(
+                        f.get_raw_f().__doc__ or "No documentation available."
+                    )
+                    return
+
+                remote_modal_functions.append(obj)
 
         console.print(
             f"[bold]Help for application '[green]{app_path}[/green]':[/bold]\n"
         )
+        if remote_modal_functions:
+            console.print(
+                f"[bold]Modal functions in this app:[/bold] [green]{', '.join(remote_modal_functions)}[/green]\n"
+            )
         if docstring := module.__doc__:
             rendered_doc = Markdown(docstring)
             console.print(rendered_doc)
@@ -111,34 +171,15 @@ def show_app_help(
         raise typer.Exit(code=1) from e
 
 
-def _run_command(cmd: list[str], **kwargs) -> None:
-    """Run a shell command and stream output to stdout."""
-    import subprocess as sp
-
-    print(f"Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
-
-
 @app.command(name="run")
 def run_command(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to generate run command for.")
     ],
+    modal_mode: Annotated[
+        str,
+        typer.Option("--mode", "-m", help="Modal command to use ('run' or 'shell')."),
+    ] = "run",
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the modal run command."),
@@ -146,10 +187,15 @@ def run_command(
 ):
     """Generate the modal run command for a specific biomodals application.
 
-    Use with: `biomodals run <app-name> -- [OPTIONS]`, where `[OPTIONS]` are
+    Use with: `biomodals run <app-name> [OPTIONS] -- [app-options]`, where `[app-options]` are
     additional flags to pass to the `modal run <app-name>` command.
     """
     all_apps = get_all_apps(use_absolute_paths=True)
+    app_name_or_path, entrypoint_name = (
+        app_name_or_path.split("::")
+        if "::" in app_name_or_path
+        else (app_name_or_path, None)
+    )
     if app_name_or_path in all_apps:
         app_path = all_apps[app_name_or_path]
     else:
@@ -160,10 +206,15 @@ def run_command(
             )
             raise typer.Exit(code=1)
 
-    cmd = ["modal", "run", str(app_path)]
+    full_app = (
+        str(app_path) if entrypoint_name is None else f"{app_path}::{entrypoint_name}"
+    )
+    cmd = ["modal", modal_mode, full_app]
+
     if flags:
-        cmd.extend(flags)
-        _run_command(cmd)
+        _run_command([*cmd, *flags])
+    elif entrypoint_name is not None:
+        _run_command(["biomodals", "help", str(full_app)])
     else:
         _run_command(["biomodals", "help", str(app_path)])
 
