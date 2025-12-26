@@ -23,7 +23,7 @@ from modal import App, Image, Volume
 ##########################################
 # T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
 # https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "A10G")
+GPU = os.environ.get("GPU", "L40S")
 TIMEOUT = int(os.environ.get("TIMEOUT", "86400"))  # seconds
 APP_NAME = os.environ.get("MODAL_APP", "Gromacs")
 N_GMX_THREADS = int(os.environ.get("N_GMX_THREADS", "16"))
@@ -255,10 +255,15 @@ def prepare_tpr_gpu(
     ]
     if run_pdbfixer:
         cmd.append("--fix-pdb")
+
     if use_openmp_threads:
         cmd.append("--use-openmp-threads")
+    # Modal adds this automatically but we want Gromacs to handle threading
+    env = os.environ.copy()
+    if "OMP_NUM_THREADS" in env:
+        del env["OMP_NUM_THREADS"]
 
-    _ = run_command(cmd, cwd=str(work_path))
+    _ = run_command(cmd, cwd=str(work_path), env=env)
     OUTPUTS_VOLUME.commit()
     return work_path
 
