@@ -142,14 +142,12 @@ def package_outputs(
     from pathlib import Path
 
     dir_path = Path(dir)
-    cmd = ["tar", "--zstd"]
+    cmd = ["tar", "-I", f"zstd -T{num_threads}"]  # ZSTD_NBTHREADS
     if tar_args is not None:
         cmd.extend(tar_args)
-    cmd.extend(["-cf", "-", dir_path.name])
+    cmd.extend(["-c", dir_path.name])
 
-    return sp.check_output(
-        cmd, cwd=dir_path.parent, env={"ZSTD_NBTHREADS": str(num_threads)}
-    )  # noqa: S603
+    return sp.check_output(cmd, cwd=dir_path.parent)
 
 
 ##########################################
@@ -336,6 +334,7 @@ def prepare_abcfold2(
 
 @app.function(
     cpu=(0.125, 16.125),  # burst for tar compression
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
@@ -344,6 +343,7 @@ def collect_abcfold2_boltz_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
 ):
     """Manage Boltz runs and return all Boltz results."""
+    import time
     from pathlib import Path
 
     work_path = Path(run_conf["workdir"]).expanduser().resolve()
@@ -369,6 +369,7 @@ def collect_abcfold2_boltz_data(
 
     OUTPUTS_VOLUME.reload()
     print("Packaging Boltz results...")
+    now = time.time()
     boltz_tarball_bytes = package_outputs(
         str(work_path),
         [
@@ -382,7 +383,7 @@ def collect_abcfold2_boltz_data(
             "msa",
         ],
     )
-    print("Packaging complete.")
+    print(f"Packaging complete, took {time.time() - now:.2f} seconds.")
     return boltz_tarball_bytes
 
 
@@ -428,6 +429,7 @@ def run_abcfold2_boltz(
 
 @app.function(
     cpu=(0.125, 16.125),  # burst for tar compression
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
@@ -436,6 +438,7 @@ def collect_abcfold2_chai_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
 ):
     """Manage Chai runs and return all Chai results."""
+    import time
     from pathlib import Path
 
     work_path = Path(run_conf["workdir"]).expanduser().resolve()
@@ -461,8 +464,9 @@ def collect_abcfold2_chai_data(
 
     OUTPUTS_VOLUME.reload()
     print("Packaging Chai results...")
+    now = time.time()
     chai_tarball_bytes = package_outputs(str(work_path))
-    print("Packaging complete.")
+    print(f"Packaging complete, took {time.time() - now:.2f} seconds.")
     return chai_tarball_bytes
 
 
