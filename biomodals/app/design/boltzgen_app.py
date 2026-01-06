@@ -127,10 +127,10 @@ def package_outputs(
     from pathlib import Path
 
     root_path = Path(root)  # don't resolve, as the mapped location could be a soft link
-    cmd = ["tar", "--zstd"]
+    cmd = ["tar", "-I", f"zstd -T{num_threads}"]  # ZSTD_NBTHREADS
     if tar_args is not None:
         cmd.extend(tar_args)
-    cmd.extend(["-cf", "-"])
+    cmd.extend(["-c"])
 
     # Our volume file structure is: outputs/[run_id]/...
     # We want to preserve the relative paths
@@ -141,9 +141,7 @@ def package_outputs(
         else:
             print(f"Warning: path {out_path} does not exist and will be skipped.")
 
-    return sp.check_output(
-        cmd, cwd=root_path.parent, env=os.environ | {"ZSTD_NBTHREADS": str(num_threads)}
-    )  # noqa: S603
+    return sp.check_output(cmd, cwd=root_path.parent)
 
 
 def run_command(cmd: list[str], **kwargs) -> None:
@@ -321,7 +319,7 @@ def collect_boltzgen_data(
     extra_args: str | None = None,
     salvage_mode: bool = False,
     package_results: bool = True,
-) -> bytes:
+) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
     from datetime import UTC, datetime
     from uuid import uuid4
@@ -386,6 +384,7 @@ def collect_boltzgen_data(
         print(
             f"Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
         )
+        return run_ids
 
 
 @app.function(
@@ -500,6 +499,7 @@ def submit_boltzgen_task(
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
+    compress_results: bool = False,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
 
@@ -517,6 +517,9 @@ def submit_boltzgen_task(
         steps: Specific pipeline steps to run (e.g. "design inverse_folding")
         extra_args: Additional CLI arguments as string
         salvage_mode: Whether to only try to finish incomplete runs
+        compress_results: If true, bundle results into a tarball and download to `out_dir`.
+            Otherwise, use subprocesses to call `modal volume get` for downloads.
+            This flag is useless if `out_dir` is None.
     """
     from pathlib import Path
 
@@ -564,11 +567,38 @@ def submit_boltzgen_task(
         steps=steps,
         extra_args=extra_args,
         salvage_mode=salvage_mode,
-        package_results=out_dir is not None,
+        package_results=compress_results and out_dir is not None,
     )
     if out_dir is not None:
         local_out_dir = Path(out_dir).expanduser().resolve()
         local_out_dir.mkdir(parents=True, exist_ok=True)
-        (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
+        if compress_results:
+            (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
+        else:
+            (local_out_dir / "outputs").mkdir(exist_ok=True)
+            for run_id in outputs:
+                run_out_dir: Path = local_out_dir / "outputs" / run_id
+                run_out_dir.mkdir(parents=True, exist_ok=True)
+                remote_root_dir = f"{run_name}/outputs/{run_id}"
+                print(f"Downloading results for run ID {run_id}...")
+                for subdir in (
+                    "boltzgen-run.log",
+                    f"{run_name}.cif",
+                    "final_ranked_designs",
+                    "intermediate_designs_inverse_folded",
+                ):
+                    if (run_out_dir / subdir).exists():
+                        continue
+
+                    run_command(
+                        [
+                            "modal",
+                            "volume",
+                            "get",
+                            OUTPUTS_VOLUME_NAME,
+                            f"{remote_root_dir}/{subdir}",
+                        ],
+                        cwd=run_out_dir,
+                    )
 
         print(f"Results saved to: {local_out_dir}")
