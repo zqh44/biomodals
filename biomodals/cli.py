@@ -68,7 +68,12 @@ def _run_command(
     kwargs.setdefault("stderr", sp.STDOUT)
     kwargs.setdefault("bufsize", 1)
     kwargs.setdefault("encoding", "utf-8")
-    kwargs.setdefault("env", os.environ | {"SYSTEMD_COLORS": "1"})
+
+    default_env = os.environ | {"SYSTEMD_COLORS": "1"}
+    if "env" not in kwargs:
+        kwargs["env"] = default_env
+    else:
+        kwargs["env"] = default_env | kwargs["env"]
 
     with sp.Popen(cmd, **kwargs) as p:
         if p.stdout is None:
@@ -242,7 +247,14 @@ def run_command(
     cmd.append(str(full_app))
 
     if flags:
-        _run_command([*cmd, *flags], console_kwargs={"markup": False})
+        # Smart guess of run_name to modify the MODAL_APP environment variable
+        run_name_idx = flags.index("--run-name") + 1 if "--run-name" in flags else None
+        if run_name_idx:
+            app_name = app_path.stem.replace("_app", "")
+            env = {"MODAL_APP": f"#{app_name}# {flags[run_name_idx]}"}
+        else:
+            env = {}
+        _run_command([*cmd, *flags], console_kwargs={"markup": False}, env=env)
     elif entrypoint_name is not None:
         _run_command(["biomodals", "help", str(full_app)])
     else:
