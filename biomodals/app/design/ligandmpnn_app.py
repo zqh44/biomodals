@@ -1,0 +1,427 @@
+"""LigandMPNN source repo: <https://github.com/dauparas/LigandMPNN>.
+
+## Model checkpoints
+
+See <https://github.com/dauparas/LigandMPNN#available-models> for details.
+
+## Configuration
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MODAL_APP` | `LigandMPNN` | Name of the Modal app to use. |
+| `GPU` | `L40S` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
+| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
+
+## Outputs
+
+* Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
+"""
+
+# Ignore ruff warnings about import location and unsafe subprocess usage
+# ruff: noqa: PLC0415, S603
+import os
+from pathlib import Path
+
+from modal import App, Image, Volume
+
+##########################################
+# Modal configs
+##########################################
+# https://modal.com/docs/guide/gpu
+GPU = os.environ.get("GPU", "L40S")
+TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # for inputs and startup in seconds
+APP_NAME = os.environ.get("MODAL_APP", "LigandMPNN")
+
+# Volume for model cache
+LIGANDMPNN_VOLUME_NAME = "ligandmpnn-models"
+LIGANDMPNN_VOLUME = Volume.from_name(LIGANDMPNN_VOLUME_NAME, create_if_missing=True)
+
+# Volume for outputs
+OUTPUTS_VOLUME_NAME = "ligandmpnn-outputs"
+OUTPUTS_VOLUME = Volume.from_name(
+    OUTPUTS_VOLUME_NAME, create_if_missing=True, version=2
+)
+OUTPUTS_DIR = "/ligandmpnn-outputs"
+
+# Repositories and commit hashes
+REPO_URL = "https://github.com/dauparas/LigandMPNN"
+REPO_COMMIT = "26ec57ac976ade5379920dbd43c7f97a91cf82de"
+REPO_DIR = "/opt/LigandMPNN"
+
+##########################################
+# Image and app definitions
+##########################################
+runtime_image = (
+    Image.debian_slim()
+    .apt_install("git", "build-essential", "zstd")
+    .env(
+        {
+            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
+            # https://modal.com/docs/guide/cuda
+            "UV_TORCH_BACKEND": "cu121",  # find best torch and CUDA versions
+        }
+    )
+    .run_commands(
+        " && ".join(
+            (
+                f"git clone {REPO_URL} {REPO_DIR}",
+                f"cd {REPO_DIR}",
+                f"git checkout {REPO_COMMIT}",
+                "uv venv --python 3.11",
+                "uv pip install -r requirements.txt",
+            ),
+        )
+    )
+    .env({"PATH": f"{REPO_DIR}/.venv/bin:$PATH"})
+    .run_commands("uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm")
+    .apt_install("wget", "fd-find")
+    .workdir(REPO_DIR)
+)
+
+app = App(APP_NAME, image=runtime_image)
+
+
+##########################################
+# Helper functions
+##########################################
+def run_command(cmd: list[str], **kwargs) -> None:
+    """Run a shell command and stream output to stdout."""
+    import subprocess as sp
+
+    print(f"💊 Running command: {' '.join(cmd)}")
+    # Set default kwargs for sp.Popen
+    kwargs.setdefault("stdout", sp.PIPE)
+    kwargs.setdefault("stderr", sp.STDOUT)
+    kwargs.setdefault("bufsize", 1)
+    kwargs.setdefault("encoding", "utf-8")
+
+    with sp.Popen(cmd, **kwargs) as p:
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        buffered_output = None
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+            print(buffered_output, end="", flush=True)
+
+        if p.returncode != 0:
+            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+
+
+##########################################
+# Fetch model weights
+##########################################
+@app.function(
+    volumes={f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME},
+    timeout=TIMEOUT,
+    image=runtime_image,
+)
+def download_weights() -> None:
+    """Download ProteinMPNN models into the mounted volume."""
+    print("💊 Downloading boltzgen models...")
+    cmd = ["bash", f"{REPO_DIR}/get_model_params.sh", f"{REPO_DIR}/model_params"]
+
+    run_command(cmd, cwd=REPO_DIR)
+    LIGANDMPNN_VOLUME.commit()
+    print("💊 Model download complete")
+
+
+##########################################
+# Inference functions
+##########################################
+@app.function(
+    gpu=GPU,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=86400,
+    volumes={
+        f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME.read_only(),
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
+    },
+    image=runtime_image,
+)
+def ligandmpnn_run(
+    run_name: str,
+    struct_bytes: bytes,
+    cli_args: dict[str, str | int | float | bool],
+    bias_aa_per_residue_bytes: bytes | None = None,
+    omit_aa_per_residue_bytes: bytes | None = None,
+) -> str:
+    """Run LigandMPNN with the specifi ed CLI arguments.
+
+    Returns:
+        Path to output directory as a string.
+    """
+    import subprocess as sp
+    import time
+    from datetime import UTC, datetime
+
+    # Build command
+    workdir = Path(str(cli_args["--out_folder"]))
+    if workdir.exists():
+        print(f"💊 Output path {workdir} already exists, skipping run.")
+        return str(workdir.relative_to(OUTPUTS_DIR))
+
+    for d in ("inputs", "outputs"):
+        (workdir / d).mkdir(parents=True, exist_ok=True)
+
+    cli_args["--out_folder"] = str(workdir / "outputs")
+    input_pdb_file = workdir / "inputs" / f"{run_name}.pdb"
+    with open(input_pdb_file, "wb") as f:
+        f.write(struct_bytes)
+        cli_args["--pdb_path"] = str(input_pdb_file)
+
+    if bias_aa_per_residue_bytes is not None:
+        bias_aa_per_res_file = workdir / "inputs" / "bias_AA_per_residue.json"
+        with open(bias_aa_per_res_file, "wb") as f:
+            f.write(bias_aa_per_residue_bytes)
+            cli_args["--bias_AA_per_residue"] = str(bias_aa_per_res_file)
+    if omit_aa_per_residue_bytes is not None:
+        omit_aa_per_res_file = workdir / "inputs" / "omit_AA_per_residue.json"
+        with open(omit_aa_per_res_file, "wb") as f:
+            f.write(omit_aa_per_residue_bytes)
+            cli_args["--omit_AA_per_residue"] = str(omit_aa_per_res_file)
+
+    cmd = ["python", f"{REPO_DIR}/run.py"]
+    for arg, val in cli_args.items():
+        if isinstance(val, bool):
+            cmd.extend([str(arg), str(int(val))])
+        else:
+            cmd.extend([str(arg), str(val)])
+
+    log_path = workdir / "ligandmpnn-run.log"
+    print(f"💊 Running LigandMPNN, saving logs to {log_path}")
+    with (
+        sp.Popen(
+            cmd,
+            bufsize=1,
+            stdout=sp.PIPE,
+            stderr=sp.STDOUT,
+            encoding="utf-8",
+            cwd=REPO_DIR,
+        ) as p,
+        open(log_path, "a", buffering=1) as log_file,
+    ):
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        now = time.time()
+        banner = "=" * 100
+        log_file.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
+        log_file.write(f"Running command: {' '.join(cmd)}\n{banner}\n")
+
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+            log_file.write(buffered_output)  # not realtime without volume commit
+            print(buffered_output)
+
+        log_file.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
+        log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
+
+        if p.returncode != 0:
+            print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
+            raise sp.CalledProcessError(p.returncode, cmd)
+
+    OUTPUTS_VOLUME.commit()
+    return str(workdir.relative_to(OUTPUTS_DIR))
+
+
+##########################################
+# Entrypoint for ephemeral usage
+##########################################
+@app.local_entrypoint()
+def submit_ligandmpnn_task(
+    # Input and output
+    input_pdb: str,
+    out_dir: str | None = None,
+    run_name: str | None = None,
+    download_models: bool = False,
+    # Model configuration
+    model_type: str = "soluble_mpnn",
+    checkpoint: str | None = None,
+    seed: int = 0,
+    batch_size: int = 1,
+    number_of_batches: int = 1,
+    temperature: float = 0.1,
+    ligand_mpnn_use_atom_context: bool = True,
+    ligand_mpnn_cutoff_for_score: float = 8.0,
+    ligand_mpnn_use_side_chain_context: bool = False,
+    global_transmembrane_label: bool = False,
+    parse_atoms_with_zero_occupancy: bool = False,
+    pack_side_chains: bool = False,
+    number_of_packs_per_design: int = 4,
+    sc_num_denoising_steps: int = 3,
+    sc_num_samples: int = 16,
+    repack_everything: bool = False,
+    pack_with_ligand_context: bool = True,
+    # Input-specific options
+    fixed_residues: str | None = None,
+    redesigned_residues: str | None = None,
+    bias_aa: str | None = None,
+    bias_aa_per_residue: str | None = None,
+    omit_aa: str | None = None,
+    omit_aa_per_residue: str | None = None,
+    symmetry_residues: str | None = None,
+    is_homo_oligomer: bool = False,
+    chains_to_design: str | None = None,
+    parse_these_chains_only: str | None = None,
+    transmembrane_buried: str | None = None,
+    transmembrane_interface: str | None = None,
+) -> None:
+    """Run a variant of the ProteinMPNN models with results saved to `out_dir`.
+
+    Args:
+        input_pdb: Path to the input PDB structure file
+        out_dir: Local output directory; defaults to $PWD
+        run_name: Name for this run; defaults to input structure stem
+        download_models: Whether to download model weights and skip running
+
+        model_type: One of: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn,
+            global_label_membrane_mpnn, soluble_mpnn
+        checkpoint: Optional path to model weights. Note that the name should match
+            the `model_type` specified.
+        seed: Random seed for design generation
+        batch_size: Number of sequence to generate per one pass
+        number_of_batches: Number of times to design sequence using a chosen batch size
+        temperature: Sampling temperature for design generation
+        ligand_mpnn_use_atom_context: Whether to use atom-level context in LigandMPNN
+        ligand_mpnn_cutoff_for_score: Cutoff in angstroms between protein and context
+            atoms to select residues for reporting score
+        ligand_mpnn_use_side_chain_context: Whether to use side chain atoms as ligand
+            context for the fixed residues
+        global_transmembrane_label: Whether to provide global label for the
+            `global_label_membrane_mpnn` model. 1 - transmembrane, 0 - soluble
+        parse_atoms_with_zero_occupancy: Whether to parse atoms with 0 occupancy
+        pack_side_chains: Whether to run side chain packer
+        number_of_packs_per_design: Number of independent side chain packing samples to return per design
+        sc_num_denoising_steps: Number of denoising/recycling steps to make for side chain packing
+        sc_num_samples: Number of samples to draw from a mixture distribution
+            and then take a sample with the highest likelihood
+        repack_everything: 1 - repacks side chains of all residues including the fixed ones;
+            0 - keeps the side chains fixed for fixed residues
+        pack_with_ligand_context: 1 - pack side chains using ligand context
+             0 - do not use it
+
+        fixed_residues: Space-separated list of residue to keep fixed,
+            e.g. "A12 A13 A14 B2 B25"
+        redesigned_residues: Space-separated list of residues to redesign,
+            e.g. "A15 A16 A17 B3 B4". Everything else will be fixed.
+        bias_aa: Bias generation of amino acids, e.g. "A:-1.024,P:2.34,C:-12.34"
+        bias_aa_per_residue: Path to json mapping of bias,
+            e.g. {'A12': {'G': -0.3, 'C': -2.0, 'H': 0.8}, 'A13': {'G': -1.3}}
+        omit_aa: Exclude amino acids from generation, e.g. "ACG"
+        omit_aa_per_residue: Path to json mapping of amino acids to exclude,
+            e.g. {'A12': 'APQ', 'A13': 'QST'}
+        symmetry_residues: Add list of lists for which residues need to be symmetric,
+            e.g. "A12,A13,A14|C2,C3|A5,B6"
+        is_homo_oligomer: This flag will automatically set `--symmetry_residues` and
+            `--symmetry_weights` to do homooligomer design with equal weighting
+        chains_to_design: Specify which chains to redesign and all others will be kept fixed.
+            e.g. "A,B,C,F"
+        parse_these_chains_only: Provide chains letters for parsing backbones,
+            e.g. "A,B,C,F"
+        transmembrane_buried: Provide buried residues when using the model
+            `checkpoint_per_residue_label_membrane_mpnn`, e.g. "A12 A13 A14 B2 B25"
+        transmembrane_interface: Provide interface residues when using the model
+            `checkpoint_per_residue_label_membrane_mpnn`, e.g. "A12 A13 A14 B2 B25"
+    """
+    from pathlib import Path
+
+    if download_models:
+        download_weights.remote()
+        return
+
+    print("🧬 Checking input arguments...")
+    input_path = Path(input_pdb).expanduser()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input structure file not found: {input_path}")
+    if run_name is None:
+        run_name = input_path.stem
+
+    struct_bytes = input_path.read_bytes()
+    cli_args = {
+        "--out_folder": f"{OUTPUTS_DIR}/{run_name}-seed{seed}",
+        "--model_type": model_type,
+        "--seed": str(seed),
+        "--batch_size": str(batch_size),
+        "--number_of_batches": str(number_of_batches),
+        "--temperature": str(temperature),
+        "--save_stats": "1",
+        # 0/1 flags
+        "--ligand_mpnn_use_atom_context": ligand_mpnn_use_atom_context,
+        "--ligand_mpnn_cutoff_for_score": str(ligand_mpnn_cutoff_for_score),
+        "--ligand_mpnn_use_side_chain_context": ligand_mpnn_use_side_chain_context,
+        "--global_transmembrane_label": global_transmembrane_label,
+        "--parse_atoms_with_zero_occupancy": parse_atoms_with_zero_occupancy,
+        "--pack_side_chains": pack_side_chains,
+        "--number_of_packs_per_design": str(number_of_packs_per_design),
+        "--sc_num_denoising_steps": str(sc_num_denoising_steps),
+        "--sc_num_samples": str(sc_num_samples),
+        "--repack_everything": repack_everything,
+        "--pack_with_ligand_context": pack_with_ligand_context,
+    }
+    if checkpoint is not None:
+        cli_args[f"--checkpoint_{model_type}"] = checkpoint
+    if fixed_residues is not None:
+        cli_args["--fixed_residues"] = fixed_residues
+    if redesigned_residues is not None:
+        cli_args["--redesigned_residues"] = redesigned_residues
+    if bias_aa is not None:
+        cli_args["--bias_AA"] = bias_aa
+    if omit_aa is not None:
+        cli_args["--omit_AA"] = omit_aa
+    if symmetry_residues is not None:
+        cli_args["--symmetry_residues"] = symmetry_residues
+    if is_homo_oligomer:
+        cli_args["--homo_oligomer"] = "1"
+    if chains_to_design is not None:
+        cli_args["--chains_to_design"] = chains_to_design
+    if parse_these_chains_only is not None:
+        cli_args["--parse_these_chains_only"] = parse_these_chains_only
+    if transmembrane_buried is not None:
+        if model_type != "per_residue_label_membrane_mpnn":
+            print(
+                "⚠ --transmembrane_buried only applies when model_type == 'per_residue_label_membrane_mpnn'"
+            )
+        else:
+            cli_args["--transmembrane_buried"] = transmembrane_buried
+    if transmembrane_interface is not None:
+        if model_type != "per_residue_label_membrane_mpnn":
+            print(
+                "⚠ --transmembrane_interface only applies when model_type == 'per_residue_label_membrane_mpnn'"
+            )
+        else:
+            cli_args["--transmembrane_interface"] = transmembrane_interface
+
+    bias_AA_per_residue_bytes = None
+    if bias_aa_per_residue is not None:
+        bias_AA_per_res_path = Path(bias_aa_per_residue).expanduser()
+        if not bias_AA_per_res_path.exists():
+            raise FileNotFoundError(
+                f"Bias AA per residue file not found: {bias_AA_per_res_path}"
+            )
+        bias_AA_per_residue_bytes = bias_AA_per_res_path.read_bytes()
+
+    omit_AA_per_residue_bytes = None
+    if omit_aa_per_residue is not None:
+        omit_AA_per_res_path = Path(omit_aa_per_residue).expanduser()
+        if not omit_AA_per_res_path.exists():
+            raise FileNotFoundError(
+                f"Omit AA per residue file not found: {omit_AA_per_res_path}"
+            )
+        omit_AA_per_residue_bytes = omit_AA_per_res_path.read_bytes()
+
+    print("🧬 Running LigandMPNN...")
+    remote_results_dir = ligandmpnn_run.remote(
+        run_name,
+        struct_bytes,
+        cli_args,
+        bias_AA_per_residue_bytes,
+        omit_AA_per_residue_bytes,
+    )
+    local_out_dir = Path(out_dir).expanduser()
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"🧬 Downloading results for {run_name}...")
+    run_command(
+        ["modal", "volume", "get", OUTPUTS_VOLUME_NAME, str(remote_results_dir)],
+        cwd=local_out_dir,
+    )
+    print(f"🧬 Results saved to: {local_out_dir.resolve()}")
