@@ -6,11 +6,6 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 
 ## Configuration
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-struct` | **Required** | Path to structure coordinates file. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in a Modal volume only. |
-
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
 | `MODAL_APP` | `LigandMPNN` | Name of the Modal app to use. |
@@ -93,7 +88,7 @@ def run_command(cmd: list[str], **kwargs) -> None:
     """Run a shell command and stream output to stdout."""
     import subprocess as sp
 
-    print(f"Running command: {' '.join(cmd)}")
+    print(f"💊 Running command: {' '.join(cmd)}")
     # Set default kwargs for sp.Popen
     kwargs.setdefault("stdout", sp.PIPE)
     kwargs.setdefault("stderr", sp.STDOUT)
@@ -122,100 +117,19 @@ def run_command(cmd: list[str], **kwargs) -> None:
 )
 def download_weights() -> None:
     """Download ProteinMPNN models into the mounted volume."""
-    print("Downloading boltzgen models...")
+    print("💊 Downloading boltzgen models...")
     cmd = ["bash", f"{REPO_DIR}/get_model_params.sh", f"{REPO_DIR}/model_params"]
 
     run_command(cmd, cwd=REPO_DIR)
     LIGANDMPNN_VOLUME.commit()
-    print("Model download complete")
+    print("💊 Model download complete")
 
 
 ##########################################
 # Inference functions
 ##########################################
 @app.function(
-    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
-    image=runtime_image,
-)
-def collect_ligandmpnn_data(input_struct_bytes: bytes, run_args: dict[str, str]) -> str:
-    """Collect BoltzGen output data from multiple runs."""
-    from datetime import UTC, datetime
-    from uuid import uuid4
-
-    outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
-    if salvage_mode:
-        all_run_dirs = [d for d in outdir.iterdir() if d.is_dir()]
-        run_dirs = [
-            d
-            for d in all_run_dirs
-            if not (
-                (d_final_dir := (d / "final_ranked_designs")).exists()
-                and (d_final_dir / "results_overview.pdf").exists()
-            )
-        ]
-        run_ids = [d.name for d in all_run_dirs]
-    else:
-        today: str = datetime.now(UTC).strftime("%Y%m%d")
-        run_dirs = [outdir / f"{today}-{uuid4().hex}" for _ in range(num_parallel_runs)]
-        run_ids = [d.name for d in run_dirs]
-
-    kwargs = {
-        "input_yaml_path": str(
-            outdir.parent / "inputs" / "config" / f"{run_name}.yaml"
-        ),
-        "protocol": protocol,
-        "num_designs": num_designs,
-        "steps": steps,
-        "extra_args": extra_args,
-    }
-    cli_args_json_path = outdir.parent / "inputs" / "config" / "cli-args.json"
-    if not cli_args_json_path.exists():
-        import json
-
-        # Save a copy of the CLI args for reference
-        with cli_args_json_path.open("w") as f:
-            json.dump(kwargs, f, indent=2)
-
-    if run_dirs:
-        for boltzgen_dir in ligandmpnn_run.map(run_dirs, kwargs=kwargs):
-            print(f"BoltzGen run completed: {boltzgen_dir}")
-
-    OUTPUTS_VOLUME.reload()
-    if refilter_results:
-        # Rerun BoltzGen filters on all run IDs, and only download the designs
-        # that passed all filters (also limited by the `budget`)
-        print("Collecting BoltzGen outputs...")
-        combine_multiple_runs.remote(run_name)
-        refilter_designs.remote(run_name)
-        OUTPUTS_VOLUME.reload()
-
-        tarball_bytes = package_outputs.remote(
-            outdir,
-            run_ids,
-            tar_args=[
-                "--exclude",
-                "intermediate_designs",  # intermediate_designs_inverse_folded is enough
-                "--exclude",
-                "lightning_logs",
-                "--exclude",
-                "metrics_tmp",  # design_seq, ca_coords, ca_coords_refolded
-            ],
-        )
-        print("Packaging complete.")
-        return tarball_bytes
-    else:
-        print("Skipping refiltering of BoltzGen outputs.")
-        print(
-            f"Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
-        )
-        return run_ids
-
-
-@app.function(
     gpu=GPU,
-    cpu=1.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=86400,
     volumes={
@@ -224,16 +138,14 @@ def collect_ligandmpnn_data(input_struct_bytes: bytes, run_args: dict[str, str])
     },
     image=runtime_image,
 )
-def ligandmpnn_run(cli_args: dict[str, str]) -> str:
-    """Run BoltzGen on a yaml specification.
-
-    Args:
-        out_dir: Output directory path
-        input_yaml_path: Path to YAML design specification file
-        protocol: Design protocol (protein-anything, peptide-anything, etc.)
-        num_designs: Number of designs to generate
-        steps: Specific pipeline steps to run (e.g. "design inverse_folding")
-        extra_args: Additional CLI arguments as string
+def ligandmpnn_run(
+    run_name: str,
+    struct_bytes: bytes,
+    cli_args: dict[str, str | int | float | bool],
+    bias_aa_per_residue_bytes: bytes | None = None,
+    omit_aa_per_residue_bytes: bytes | None = None,
+) -> str:
+    """Run LigandMPNN with the specifi ed CLI arguments.
 
     Returns:
         Path to output directory as a string.
@@ -243,18 +155,44 @@ def ligandmpnn_run(cli_args: dict[str, str]) -> str:
     from datetime import UTC, datetime
 
     # Build command
+    workdir = Path(str(cli_args["--out_folder"]))
+    if workdir.exists():
+        print(f"💊 Output path {workdir} already exists, skipping run.")
+        return str(workdir.relative_to(OUTPUTS_DIR))
+
+    for d in ("inputs", "outputs"):
+        (workdir / d).mkdir(parents=True, exist_ok=True)
+
+    cli_args["--out_folder"] = str(workdir / "outputs")
+    input_pdb_file = workdir / "inputs" / f"{run_name}.pdb"
+    with open(input_pdb_file, "wb") as f:
+        f.write(struct_bytes)
+        cli_args["--pdb_path"] = str(input_pdb_file)
+
+    if bias_aa_per_residue_bytes is not None:
+        bias_aa_per_res_file = workdir / "inputs" / "bias_AA_per_residue.json"
+        with open(bias_aa_per_res_file, "wb") as f:
+            f.write(bias_aa_per_residue_bytes)
+            cli_args["--bias_AA_per_residue"] = str(bias_aa_per_res_file)
+    if omit_aa_per_residue_bytes is not None:
+        omit_aa_per_res_file = workdir / "inputs" / "omit_AA_per_residue.json"
+        with open(omit_aa_per_res_file, "wb") as f:
+            f.write(omit_aa_per_residue_bytes)
+            cli_args["--omit_AA_per_residue"] = str(omit_aa_per_res_file)
+
     cmd = ["python", f"{REPO_DIR}/run.py"]
     for arg, val in cli_args.items():
-        cmd.extend([f"--{arg.replace('_', '-')}", str(val)])
+        if isinstance(val, bool):
+            cmd.extend([str(arg), str(int(val))])
+        else:
+            cmd.extend([str(arg), str(val)])
 
-    out_path = Path(cli_args["out_folder"])
-    out_path.mkdir(parents=True, exist_ok=True)
-    log_path = out_path / "ligandmpnn-run.log"
-    print(f"Running LigandMPNN, saving logs to {log_path}")
+    log_path = workdir / "ligandmpnn-run.log"
+    print(f"💊 Running LigandMPNN, saving logs to {log_path}")
     with (
         sp.Popen(
             cmd,
-            bufsize=8,
+            bufsize=1,
             stdout=sp.PIPE,
             stderr=sp.STDOUT,
             encoding="utf-8",
@@ -262,6 +200,9 @@ def ligandmpnn_run(cli_args: dict[str, str]) -> str:
         ) as p,
         open(log_path, "a", buffering=1) as log_file,
     ):
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
         now = time.time()
         banner = "=" * 100
         log_file.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
@@ -275,11 +216,11 @@ def ligandmpnn_run(cli_args: dict[str, str]) -> str:
         log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
 
         if p.returncode != 0:
-            print(f"BoltzGen run failed. Error log is in {log_path}")
+            print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
             raise sp.CalledProcessError(p.returncode, cmd)
 
     OUTPUTS_VOLUME.commit()
-    return str(out_dir)
+    return str(workdir.relative_to(OUTPUTS_DIR))
 
 
 ##########################################
@@ -288,36 +229,98 @@ def ligandmpnn_run(cli_args: dict[str, str]) -> str:
 @app.local_entrypoint()
 def submit_ligandmpnn_task(
     # Input and output
-    input_struct: str,
-    out_dir: str,
+    input_pdb: str,
+    out_dir: str | None = None,
     run_name: str | None = None,
-    num_designs: int = 10,
     download_models: bool = False,
-    # Run configuration
+    # Model configuration
     model_type: str = "soluble_mpnn",
     checkpoint: str | None = None,
+    seed: int = 0,
+    batch_size: int = 1,
+    number_of_batches: int = 1,
+    temperature: float = 0.1,
+    ligand_mpnn_use_atom_context: bool = True,
+    ligand_mpnn_cutoff_for_score: float = 8.0,
+    ligand_mpnn_use_side_chain_context: bool = False,
+    global_transmembrane_label: bool = False,
+    parse_atoms_with_zero_occupancy: bool = False,
+    pack_side_chains: bool = False,
+    number_of_packs_per_design: int = 4,
+    sc_num_denoising_steps: int = 3,
+    sc_num_samples: int = 16,
+    repack_everything: bool = False,
+    pack_with_ligand_context: bool = True,
+    # Input-specific options
     fixed_residues: str | None = None,
     redesigned_residues: str | None = None,
     bias_aa: str | None = None,
+    bias_aa_per_residue: str | None = None,
+    omit_aa: str | None = None,
+    omit_aa_per_residue: str | None = None,
+    symmetry_residues: str | None = None,
+    is_homo_oligomer: bool = False,
+    chains_to_design: str | None = None,
+    parse_these_chains_only: str | None = None,
+    transmembrane_buried: str | None = None,
+    transmembrane_interface: str | None = None,
 ) -> None:
-    """Run a variant of the MPNN models with results saved to `out_dir`.
+    """Run a variant of the ProteinMPNN models with results saved to `out_dir`.
 
     Args:
-        input_struct: Path to YAML design specification file
+        input_pdb: Path to the input PDB structure file
         out_dir: Local output directory; defaults to $PWD
-        num_designs: Number of designs to generate
+        run_name: Name for this run; defaults to input structure stem
         download_models: Whether to download model weights and skip running
 
-        protocol: One of: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn,
+        model_type: One of: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn,
             global_label_membrane_mpnn, soluble_mpnn
         checkpoint: Optional path to model weights. Note that the name should match
             the `model_type` specified.
-        fixed_residues: Space-separated list of residue to keep fixed, e.g. "A12 A13 A14 B2 B25"
-        redesigned_residues: Space-separated list of residues to redesign, e.g. "A15 A16 A17 B3 B4".
-            Everything else will be fixed.
+        seed: Random seed for design generation
+        batch_size: Number of sequence to generate per one pass
+        number_of_batches: Number of times to design sequence using a chosen batch size
+        temperature: Sampling temperature for design generation
+        ligand_mpnn_use_atom_context: Whether to use atom-level context in LigandMPNN
+        ligand_mpnn_cutoff_for_score: Cutoff in angstroms between protein and context
+            atoms to select residues for reporting score
+        ligand_mpnn_use_side_chain_context: Whether to use side chain atoms as ligand
+            context for the fixed residues
+        global_transmembrane_label: Whether to provide global label for the
+            `global_label_membrane_mpnn` model. 1 - transmembrane, 0 - soluble
+        parse_atoms_with_zero_occupancy: Whether to parse atoms with 0 occupancy
+        pack_side_chains: Whether to run side chain packer
+        number_of_packs_per_design: Number of independent side chain packing samples to return per design
+        sc_num_denoising_steps: Number of denoising/recycling steps to make for side chain packing
+        sc_num_samples: Number of samples to draw from a mixture distribution
+            and then take a sample with the highest likelihood
+        repack_everything: 1 - repacks side chains of all residues including the fixed ones;
+            0 - keeps the side chains fixed for fixed residues
+        pack_with_ligand_context: 1 - pack side chains using ligand context
+             0 - do not use it
+
+        fixed_residues: Space-separated list of residue to keep fixed,
+            e.g. "A12 A13 A14 B2 B25"
+        redesigned_residues: Space-separated list of residues to redesign,
+            e.g. "A15 A16 A17 B3 B4". Everything else will be fixed.
         bias_aa: Bias generation of amino acids, e.g. "A:-1.024,P:2.34,C:-12.34"
-
-
+        bias_aa_per_residue: Path to json mapping of bias,
+            e.g. {'A12': {'G': -0.3, 'C': -2.0, 'H': 0.8}, 'A13': {'G': -1.3}}
+        omit_aa: Exclude amino acids from generation, e.g. "ACG"
+        omit_aa_per_residue: Path to json mapping of amino acids to exclude,
+            e.g. {'A12': 'APQ', 'A13': 'QST'}
+        symmetry_residues: Add list of lists for which residues need to be symmetric,
+            e.g. "A12,A13,A14|C2,C3|A5,B6"
+        is_homo_oligomer: This flag will automatically set `--symmetry_residues` and
+            `--symmetry_weights` to do homooligomer design with equal weighting
+        chains_to_design: Specify which chains to redesign and all others will be kept fixed.
+            e.g. "A,B,C,F"
+        parse_these_chains_only: Provide chains letters for parsing backbones,
+            e.g. "A,B,C,F"
+        transmembrane_buried: Provide buried residues when using the model
+            `checkpoint_per_residue_label_membrane_mpnn`, e.g. "A12 A13 A14 B2 B25"
+        transmembrane_interface: Provide interface residues when using the model
+            `checkpoint_per_residue_label_membrane_mpnn`, e.g. "A12 A13 A14 B2 B25"
     """
     from pathlib import Path
 
@@ -325,43 +328,100 @@ def submit_ligandmpnn_task(
         download_weights.remote()
         return
 
-    print("Running BoltzGen...")
-    input_path = Path(input_struct).expanduser().resolve()
+    print("🧬 Checking input arguments...")
+    input_path = Path(input_pdb).expanduser()
     if not input_path.exists():
         raise FileNotFoundError(f"Input structure file not found: {input_path}")
     if run_name is None:
         run_name = input_path.stem
+
     struct_bytes = input_path.read_bytes()
-    remote_results_dir = collect_ligandmpnn_data.remote(
-        run_name=run_name,
-        protocol=protocol,
-        num_designs=num_designs,
-    )
-    local_out_dir = Path(out_dir).expanduser().resolve()
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    for run_id in outputs:
-        run_out_dir: Path = local_out_dir / "outputs" / run_id
-        run_out_dir.mkdir(parents=True, exist_ok=True)
-        remote_root_dir = f"{run_name}/outputs/{run_id}"
-        print(f"Downloading results for run ID {run_id}...")
-        for subdir in (
-            "boltzgen-run.log",
-            f"{run_name}.cif",
-            "final_ranked_designs",
-            "intermediate_designs_inverse_folded",
-        ):
-            if (run_out_dir / subdir).exists():
-                continue
-
-            run_command(
-                [
-                    "modal",
-                    "volume",
-                    "get",
-                    OUTPUTS_VOLUME_NAME,
-                    f"{remote_root_dir}/{subdir}",
-                ],
-                cwd=run_out_dir,
+    cli_args = {
+        "--out_folder": f"{OUTPUTS_DIR}/{run_name}-seed{seed}",
+        "--model_type": model_type,
+        "--seed": str(seed),
+        "--batch_size": str(batch_size),
+        "--number_of_batches": str(number_of_batches),
+        "--temperature": str(temperature),
+        "--save_stats": "1",
+        # 0/1 flags
+        "--ligand_mpnn_use_atom_context": ligand_mpnn_use_atom_context,
+        "--ligand_mpnn_cutoff_for_score": str(ligand_mpnn_cutoff_for_score),
+        "--ligand_mpnn_use_side_chain_context": ligand_mpnn_use_side_chain_context,
+        "--global_transmembrane_label": global_transmembrane_label,
+        "--parse_atoms_with_zero_occupancy": parse_atoms_with_zero_occupancy,
+        "--pack_side_chains": pack_side_chains,
+        "--number_of_packs_per_design": str(number_of_packs_per_design),
+        "--sc_num_denoising_steps": str(sc_num_denoising_steps),
+        "--sc_num_samples": str(sc_num_samples),
+        "--repack_everything": repack_everything,
+        "--pack_with_ligand_context": pack_with_ligand_context,
+    }
+    if checkpoint is not None:
+        cli_args[f"--checkpoint_{model_type}"] = checkpoint
+    if fixed_residues is not None:
+        cli_args["--fixed_residues"] = fixed_residues
+    if redesigned_residues is not None:
+        cli_args["--redesigned_residues"] = redesigned_residues
+    if bias_aa is not None:
+        cli_args["--bias_AA"] = bias_aa
+    if omit_aa is not None:
+        cli_args["--omit_AA"] = omit_aa
+    if symmetry_residues is not None:
+        cli_args["--symmetry_residues"] = symmetry_residues
+    if is_homo_oligomer:
+        cli_args["--homo_oligomer"] = "1"
+    if chains_to_design is not None:
+        cli_args["--chains_to_design"] = chains_to_design
+    if parse_these_chains_only is not None:
+        cli_args["--parse_these_chains_only"] = parse_these_chains_only
+    if transmembrane_buried is not None:
+        if model_type != "per_residue_label_membrane_mpnn":
+            print(
+                "⚠ --transmembrane_buried only applies when model_type == 'per_residue_label_membrane_mpnn'"
             )
+        else:
+            cli_args["--transmembrane_buried"] = transmembrane_buried
+    if transmembrane_interface is not None:
+        if model_type != "per_residue_label_membrane_mpnn":
+            print(
+                "⚠ --transmembrane_interface only applies when model_type == 'per_residue_label_membrane_mpnn'"
+            )
+        else:
+            cli_args["--transmembrane_interface"] = transmembrane_interface
 
-    print(f"Results saved to: {local_out_dir}")
+    bias_AA_per_residue_bytes = None
+    if bias_aa_per_residue is not None:
+        bias_AA_per_res_path = Path(bias_aa_per_residue).expanduser()
+        if not bias_AA_per_res_path.exists():
+            raise FileNotFoundError(
+                f"Bias AA per residue file not found: {bias_AA_per_res_path}"
+            )
+        bias_AA_per_residue_bytes = bias_AA_per_res_path.read_bytes()
+
+    omit_AA_per_residue_bytes = None
+    if omit_aa_per_residue is not None:
+        omit_AA_per_res_path = Path(omit_aa_per_residue).expanduser()
+        if not omit_AA_per_res_path.exists():
+            raise FileNotFoundError(
+                f"Omit AA per residue file not found: {omit_AA_per_res_path}"
+            )
+        omit_AA_per_residue_bytes = omit_AA_per_res_path.read_bytes()
+
+    print("🧬 Running LigandMPNN...")
+    remote_results_dir = ligandmpnn_run.remote(
+        run_name,
+        struct_bytes,
+        cli_args,
+        bias_AA_per_residue_bytes,
+        omit_AA_per_residue_bytes,
+    )
+    local_out_dir = Path(out_dir).expanduser()
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"🧬 Downloading results for {run_name}...")
+    run_command(
+        ["modal", "volume", "get", OUTPUTS_VOLUME_NAME, str(remote_results_dir)],
+        cwd=local_out_dir,
+    )
+    print(f"🧬 Results saved to: {local_out_dir.resolve()}")
