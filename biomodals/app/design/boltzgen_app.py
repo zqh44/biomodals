@@ -29,10 +29,11 @@ For a complete set of BoltzGen CLI options that can be passed via `--extra-args`
 * Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
 * The `--run-name` and `--salvage-mode` flags can be used together to continue previous incomplete runs. When finished, all results under the same run name will be packaged and returned.
 """
+
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
-
 import os
+import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -90,6 +91,8 @@ runtime_image = (
         )
     )
     .env({"PATH": f"{BOLTZGEN_REPO_DIR}/.venv/bin:$PATH"})
+    .run_commands("uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm")
+    .apt_install("fd-find")
     .workdir(BOLTZGEN_REPO_DIR)
 )
 
@@ -315,10 +318,11 @@ def collect_boltzgen_data(
     num_parallel_runs: int,
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
+    budget: int = 10,
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
-    package_results: bool = True,
+    filter_results: bool = True,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
     from datetime import UTC, datetime
@@ -363,24 +367,29 @@ def collect_boltzgen_data(
             print(f"BoltzGen run completed: {boltzgen_dir}")
 
     OUTPUTS_VOLUME.reload()
-    if package_results:
-        print("Packaging BoltzGen outputs...")
+    if filter_results:
+        # Rerun BoltzGen filters on all run IDs, and only download the designs
+        # that passed all filters (also limited by the `budget`)
+        print("Collecting BoltzGen outputs...")
+        combine_multiple_runs.remote(run_name)
+        print("Filtering combined BoltzGen designs...")
+        refilter_designs.remote(run_name, budget)
+        OUTPUTS_VOLUME.reload()
+
+        print("Packaging filtered BoltzGen outputs...")
         tarball_bytes = package_outputs.remote(
-            outdir,
-            run_ids,
-            tar_args=[
-                "--exclude",
-                "intermediate_designs",  # intermediate_designs_inverse_folded is enough
-                "--exclude",
-                "lightning_logs",
-                "--exclude",
-                "metrics_tmp",  # design_seq, ca_coords, ca_coords_refolded
+            outdir.parent / "pass-filter-designs",
+            [
+                "all-designs.parquet",
+                "top-designs.parquet",
+                "boltzgen-cif/",
+                "refold-cif/",
             ],
         )
         print("Packaging complete.")
         return tarball_bytes
     else:
-        print("Skipping packaging of BoltzGen outputs.")
+        print("Skipping refiltering of BoltzGen outputs.")
         print(
             f"Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
         )
@@ -403,6 +412,7 @@ def boltzgen_run(
     input_yaml_path: str,
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
+    budget: int = 1,
     steps: str | None = None,
     extra_args: str | None = None,
 ) -> str:
@@ -413,6 +423,8 @@ def boltzgen_run(
         input_yaml_path: Path to YAML design specification file
         protocol: Design protocol (protein-anything, peptide-anything, etc.)
         num_designs: Number of designs to generate
+        budget: Number of designs to keep after filtering. This is not very useful
+            here because we are likely to run multiple parallel runs and combine later.
         steps: Specific pipeline steps to run (e.g. "design inverse_folding")
         extra_args: Additional CLI arguments as string
 
@@ -435,6 +447,8 @@ def boltzgen_run(
         str(out_dir),
         "--num_designs",
         str(num_designs),
+        "--budget",
+        str(budget),
         "--cache",
         str(BOLTZGEN_MODEL_DIR),
     ]
@@ -483,6 +497,166 @@ def boltzgen_run(
     return str(out_dir)
 
 
+@app.function(
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=86400,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    image=runtime_image,
+)
+def combine_multiple_runs(run_name: str):
+    """Combine outputs from multiple BoltzGen runs into a single table."""
+    import gzip
+    import pickle
+
+    import polars as pl
+    from tqdm import tqdm
+
+    workdir = Path(OUTPUTS_DIR) / run_name / "outputs"
+    out_dir = Path(OUTPUTS_DIR) / run_name / "combined-outputs"
+    (out_dir / "refold_cif").mkdir(parents=True, exist_ok=True)
+    run_ids = sorted(d.name for d in workdir.iterdir() if d.is_dir())
+
+    metrics_dfs: list[pl.DataFrame] = []
+    ca_coords_seqs_dfs: list[pl.DataFrame] = []
+    for run_id in run_ids:
+        run_design_dir = workdir / run_id / "intermediate_designs_inverse_folded"
+
+        # Metrics table required for downstream filtering
+        metrics_df = pl.read_csv(next(run_design_dir.glob("aggregate_metrics_*.csv")))
+
+        # ID, seqs, and coords required for diversity
+        with gzip.open(run_design_dir / "ca_coords_sequences.pkl.gz", "rb") as f:
+            ca_coords_seqs_df = pl.from_pandas(pickle.load(f))  # noqa: S301
+
+        # Prepend run_id to `id` and `file_name` columns to ensure uniqueness
+        metrics_df = metrics_df.with_columns(
+            pl.concat_str(pl.lit(run_id), pl.col("id"), separator="_").alias("id"),
+            pl.concat_str(pl.lit(run_id), pl.col("file_name"), separator="_").alias(
+                "file_name"
+            ),
+        )
+        ca_coords_seqs_df = ca_coords_seqs_df.with_columns(
+            pl.concat_str(pl.lit(run_id), pl.col("id"), separator="_").alias("id")
+        )
+        metrics_dfs.append(metrics_df)
+        ca_coords_seqs_dfs.append(ca_coords_seqs_df)
+
+        # Copy files to out_dir for later use
+        cif_files = list(run_design_dir.glob("*.cif"))
+        refold_cif_files = list(run_design_dir.glob("refold_cif/*.cif"))
+
+        for f in tqdm(cif_files, desc=f"Copying CIFs from {run_id}"):
+            dest = out_dir / f"{run_id}_{f.name}"
+            if not dest.exists():
+                # Make soft link instead of copy to save space
+                dest.symlink_to(f)
+                # shutil.copyfile(f, dest)
+
+        for f in tqdm(refold_cif_files, desc=f"Copying refolded CIFs from {run_id}"):
+            dest = out_dir / "refold_cif" / f"{run_id}_{f.name}"
+            if not dest.exists():
+                dest.symlink_to(f)
+                # shutil.copyfile(f, dest)
+
+    metrics_df = pl.concat(metrics_dfs, how="diagonal")
+    ca_coords_seqs_df = pl.concat(ca_coords_seqs_dfs, how="vertical")
+    if (not (out_dir / "aggregate_metrics_analyze.csv").exists()) or (
+        pl.scan_csv(out_dir / "aggregate_metrics_analyze.csv")
+        .select(pl.len())
+        .collect()
+        .item()
+        != metrics_df.height
+    ):
+        metrics_df.write_csv(out_dir / "aggregate_metrics_analyze.csv")
+        with gzip.open(out_dir / "ca_coords_sequences.pkl.gz", "wb") as f:
+            pickle.dump(ca_coords_seqs_df.to_pandas(), f)
+
+
+@app.function(
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=86400,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    image=runtime_image,
+)
+def refilter_designs(
+    run_name: str,
+    budget: int = 100,
+    rmsd_threshold: float = 4.0,
+    modality: str = "antibody",  # or "peptide"
+):
+    """Refilter combined BoltzGen designs using boltzgen.task.filter.Filter."""
+    import polars as pl
+    from boltzgen.task.filter.filter import Filter
+
+    workdir = Path(OUTPUTS_DIR) / run_name
+
+    filter_task = Filter(
+        design_dir=workdir / "combined-outputs",
+        outdir=workdir / "refiltered",
+        budget=budget,  # How many designs to subselect from all designs
+        filter_cysteine=True,  # remove designs with cysteines
+        use_affinity=False,  # When designing binders to small molecules this should be true
+        filter_bindingsite=True,  # This filters out everything that does not have a residue within 4A of a binding site residue
+        filter_designfolding=False,  # Filter by the RMSD when refolding only the designed part (usually true for proteins and false for nanobodies or peptides)
+        refolding_rmsd_threshold=rmsd_threshold,
+        modality=modality,
+        alpha=0.001,  # for diversity quality optimization: 0 = quality-only, 1 = diversity-only
+        metrics_override={  # larger value down-weights the metric's rank
+            "neg_min_design_to_target_pae": 1,
+            "design_to_target_iptm": 1,
+            "design_ptm": 2,
+            "plip_hbonds_refolded": 4,
+            "plip_saltbridge_refolded": 4,
+            "delta_sasa_refolded": 4,
+            "neg_design_hydrophobicity": 7,
+        },
+        # size_buckets=[
+        #     {"num_designs": 10, "min": 50, "max": 100}, # maximum number of designs that are allowed in the final selected diverse set
+        #     {"num_designs": 10, "min": 100, "max": 150},
+        #     {"num_designs": 10, "min": 150, "max": 200},
+        # ],
+        # additional_filters=[
+        #     {"feature": "design_ptm", "lower_is_better": False, "threshold": 0.7},
+        #     {"feature": "sheet", "lower_is_better": True, "threshold": 0.8},
+        # ],
+    )
+    filter_task.run(jupyter_nb=False)
+
+    # All designs
+    # filter_task.outdir
+    refiltered_df = pl.read_csv(
+        workdir / "refiltered" / "final_ranked_designs" / "all_designs_metrics.csv"
+    )
+
+    # Final designs
+    final_df = pl.read_csv(
+        workdir
+        / "refiltered"
+        / "final_ranked_designs"
+        / f"final_designs_metrics_{filter_task.budget}.csv"
+    )
+
+    out_dir = workdir / "pass-filter-designs"
+    for subdir in ("boltzgen-cif", "refold-cif"):
+        (out_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    refiltered_df.write_parquet(out_dir / "all-designs.parquet")
+    final_df.write_parquet(out_dir / "top-designs.parquet")
+    for r in final_df.filter("pass_filters").iter_rows(named=True):
+        r_id = r["id"]
+        r_cif_path = workdir / "combined-outputs" / f"{r_id}.cif"
+        refold_cif_path = workdir / "combined-outputs" / "refold_cif" / f"{r_id}.cif"
+
+        r_save_cif_path = out_dir / "boltzgen-cif" / f"{r_id}.cif"
+        r_save_refold_cif_path = out_dir / "refold-cif" / f"{r_id}.cif"
+        if not r_save_cif_path.exists():
+            shutil.copyfile(r_cif_path, r_save_cif_path, follow_symlinks=True)
+        if not r_save_refold_cif_path.exists():
+            shutil.copyfile(
+                refold_cif_path, r_save_refold_cif_path, follow_symlinks=True
+            )
+
+
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
@@ -496,10 +670,11 @@ def submit_boltzgen_task(
     force_redownload: bool = False,
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
+    budget: int = 10,
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
-    compress_results: bool = False,
+    filter_results: bool = False,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
 
@@ -514,10 +689,11 @@ def submit_boltzgen_task(
         protocol: Design protocol, one of: protein-anything, peptide-anything,
             protein-small_molecule, or nanobody-anything
         num_designs: Number of designs to generate
+        budget: Number of designs to keep after filtering
         steps: Specific pipeline steps to run (e.g. "design inverse_folding")
         extra_args: Additional CLI arguments as string
         salvage_mode: Whether to only try to finish incomplete runs
-        compress_results: If true, bundle results into a tarball and download to `out_dir`.
+        filter_results: If true, bundle top `'budget` results into a tarball and download to `out_dir`.
             Otherwise, use subprocesses to call `modal volume get` for downloads.
             This flag is useless if `out_dir` is None.
     """
@@ -559,46 +735,50 @@ def submit_boltzgen_task(
         print(f"Salvage mode enabled; skipping input preparation for {run_name}.")
 
     print("Running BoltzGen...")
+    budget = min(budget, num_designs)
     outputs = collect_boltzgen_data.remote(
         run_name=run_name,
         num_parallel_runs=num_parallel_runs,
         protocol=protocol,
         num_designs=num_designs,
+        budget=budget,
         steps=steps,
         extra_args=extra_args,
         salvage_mode=salvage_mode,
-        package_results=compress_results and out_dir is not None,
+        filter_results=filter_results and out_dir is not None,
     )
-    if out_dir is not None:
-        local_out_dir = Path(out_dir).expanduser().resolve()
-        local_out_dir.mkdir(parents=True, exist_ok=True)
-        if compress_results:
-            (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
-        else:
-            (local_out_dir / "outputs").mkdir(exist_ok=True)
-            for run_id in outputs:
-                run_out_dir: Path = local_out_dir / "outputs" / run_id
-                run_out_dir.mkdir(parents=True, exist_ok=True)
-                remote_root_dir = f"{run_name}/outputs/{run_id}"
-                print(f"Downloading results for run ID {run_id}...")
-                for subdir in (
-                    "boltzgen-run.log",
-                    f"{run_name}.cif",
-                    "final_ranked_designs",
-                    "intermediate_designs_inverse_folded",
-                ):
-                    if (run_out_dir / subdir).exists():
-                        continue
+    if out_dir is None:
+        return
 
-                    run_command(
-                        [
-                            "modal",
-                            "volume",
-                            "get",
-                            OUTPUTS_VOLUME_NAME,
-                            f"{remote_root_dir}/{subdir}",
-                        ],
-                        cwd=run_out_dir,
-                    )
+    local_out_dir = Path(out_dir).expanduser().resolve()
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+    if filter_results:
+        (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
+    else:
+        (local_out_dir / "outputs").mkdir(exist_ok=True)
+        for run_id in outputs:
+            run_out_dir: Path = local_out_dir / "outputs" / run_id
+            run_out_dir.mkdir(parents=True, exist_ok=True)
+            remote_root_dir = f"{run_name}/outputs/{run_id}"
+            print(f"Downloading results for run ID {run_id}...")
+            for subdir in (
+                "boltzgen-run.log",
+                f"{run_name}.cif",
+                "final_ranked_designs",
+                "intermediate_designs_inverse_folded",
+            ):
+                if (run_out_dir / subdir).exists():
+                    continue
 
-        print(f"Results saved to: {local_out_dir}")
+                run_command(
+                    [
+                        "modal",
+                        "volume",
+                        "get",
+                        OUTPUTS_VOLUME_NAME,
+                        f"{remote_root_dir}/{subdir}",
+                    ],
+                    cwd=run_out_dir,
+                )
+
+    print(f"Results saved to: {local_out_dir}")

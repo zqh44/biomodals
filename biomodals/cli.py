@@ -86,6 +86,8 @@ def _run_command(
 # CLI Commands
 ##########################################
 @app.command(name="list")
+@app.command(name="ls")
+@app.command(name="l")
 def list_available_apps(
     use_absolute_paths: Annotated[
         bool,
@@ -115,6 +117,7 @@ def list_available_apps(
 
 
 @app.command(name="help")
+@app.command(name="h")
 def show_app_help(
     app_name: Annotated[
         str, typer.Argument(help="Name or path of the app to show help for.")
@@ -142,9 +145,11 @@ def show_app_help(
         module = importlib.import_module(module_path)
 
         remote_modal_functions: list[str] = []
+        local_entrypoint_docstring: str = ""
         for obj in dir(module):
             f = getattr(module, obj)
             if isinstance(f, modal.Function):
+                # When an entrypoint name is specified, show only its docstring
                 if entrypoint_name is not None and obj == entrypoint_name:
                     console.print(
                         f"[bold]Docstring for entrypoint function '[green]{entrypoint_name}[/green]':[/bold]\n"
@@ -156,8 +161,16 @@ def show_app_help(
 
                 remote_modal_functions.append(obj)
 
+            if isinstance(f, modal.app.LocalEntrypoint):
+                local_entrypoint_docstring = f.info.raw_f.__doc__ or ""
+
         console.print(
             f"[bold]Help for application '[green]{app_path}[/green]':[/bold]\n"
+        )
+        console.print(
+            "\n\n[bold underline2]Module documentation[/bold underline2]\n",
+            justify="center",
+            highlight=True,
         )
         if remote_modal_functions:
             console.print(
@@ -166,7 +179,14 @@ def show_app_help(
         if docstring := module.__doc__:
             rendered_doc = Markdown(docstring)
             console.print(rendered_doc)
-        else:
+        if local_entrypoint_docstring:
+            console.print(
+                "\n\n[bold underline2]Local entrypoint documentation[/bold underline2]\n",
+                justify="center",
+                highlight=True,
+            )
+            console.print(local_entrypoint_docstring)
+        if not (docstring or local_entrypoint_docstring):
             console.print("No documentation available.")
     except ImportError as e:
         console.print(f"[bold red]Error:[/bold red] Failed to import '{module_path}'")
@@ -174,6 +194,7 @@ def show_app_help(
 
 
 @app.command(name="run")
+@app.command(name="r")
 def run_command(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to generate run command for.")
