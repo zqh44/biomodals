@@ -142,7 +142,7 @@ def package_outputs(
         if out_path.exists():
             cmd.append(str(out_path.relative_to(root_path.parent)))
         else:
-            print(f"Warning: path {out_path} does not exist and will be skipped.")
+            print(f"💊 Warning: path {out_path} does not exist and will be skipped.")
 
     return sp.check_output(cmd, cwd=root_path.parent)
 
@@ -151,7 +151,7 @@ def run_command(cmd: list[str], **kwargs) -> None:
     """Run a shell command and stream output to stdout."""
     import subprocess as sp
 
-    print(f"Running command: {' '.join(cmd)}")
+    print(f"💊 Running command: {' '.join(cmd)}")
     # Set default kwargs for sp.Popen
     kwargs.setdefault("stdout", sp.PIPE)
     kwargs.setdefault("stderr", sp.STDOUT)
@@ -287,14 +287,14 @@ class YAMLReferenceLoader:
 def boltzgen_download(force: bool = False) -> None:
     """Download BoltzGen models into the mounted volume."""
     # Download all artifacts (~/.cache overridden to volume mount)
-    print("Downloading boltzgen models...")
+    print("💊 Downloading boltzgen models...")
     cmd = ["boltzgen", "download", "all", "--cache", BOLTZGEN_MODEL_DIR]
     if force:
         cmd.append("--force_download")
     run_command(cmd, cwd=BOLTZGEN_REPO_DIR)
 
     BOLTZGEN_VOLUME.commit()
-    print("Model download complete")
+    print("💊 Model download complete")
 
 
 ##########################################
@@ -351,6 +351,10 @@ def collect_boltzgen_data(
     outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
     if salvage_mode:
         all_run_dirs = [d for d in outdir.iterdir() if d.is_dir()]
+        if not all_run_dirs:
+            raise RuntimeError(
+                f"💊 No existing run directories found for run name '{run_name}'."
+            )
         run_dirs = [
             d
             for d in all_run_dirs
@@ -391,19 +395,19 @@ def collect_boltzgen_data(
 
     if run_dirs:
         for boltzgen_dir in boltzgen_run.map(run_dirs, kwargs=kwargs):
-            print(f"BoltzGen run completed: {boltzgen_dir}")
+            print(f"💊 BoltzGen run completed: {boltzgen_dir}")
 
     OUTPUTS_VOLUME.reload()
     if filter_results:
         # Rerun BoltzGen filters on all run IDs, and only download the designs
         # that passed all filters (also limited by the `budget`)
-        print("Collecting BoltzGen outputs...")
-        combine_multiple_runs.remote(run_name)
-        print("Filtering combined BoltzGen designs...")
+        print("💊 Collecting BoltzGen outputs...")
+        combine_multiple_runs.remote(run_name, run_ids)
+        print("💊 Filtering combined BoltzGen designs...")
         refilter_designs.remote(run_name, budget)
         OUTPUTS_VOLUME.reload()
 
-        print("Packaging filtered BoltzGen outputs...")
+        print("💊 Packaging filtered BoltzGen outputs...")
         tarball_bytes = package_outputs.remote(
             outdir.parent / "pass-filter-designs",
             [
@@ -413,12 +417,12 @@ def collect_boltzgen_data(
                 "refold-cif/",
             ],
         )
-        print("Packaging complete.")
+        print("💊 Packaging complete.")
         return tarball_bytes
     else:
-        print("Skipping refiltering of BoltzGen outputs.")
+        print("💊 Skipping refiltering of BoltzGen outputs.")
         print(
-            f"Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
+            f"💊 Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
         )
         return run_ids
 
@@ -493,7 +497,7 @@ def boltzgen_run(
 
     out_path.mkdir(parents=True, exist_ok=True)
     log_path = out_path / "boltzgen-run.log"
-    print(f"Running BoltzGen, saving logs to {log_path}")
+    print(f"💊 Running BoltzGen, saving logs to {log_path}")
     with (
         sp.Popen(
             cmd,
@@ -518,7 +522,7 @@ def boltzgen_run(
         log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
 
         if p.returncode != 0:
-            print(f"BoltzGen run failed. Error log is in {log_path}")
+            print(f"💊 BoltzGen run failed. Error log is in {log_path}")
             raise sp.CalledProcessError(p.returncode, cmd)
 
     OUTPUTS_VOLUME.commit()
@@ -546,6 +550,7 @@ def combine_multiple_runs(run_name: str):
 
     metrics_dfs: list[pl.DataFrame] = []
     ca_coords_seqs_dfs: list[pl.DataFrame] = []
+    print(f"💊 Combining outputs from runs: {run_ids}")
     for run_id in run_ids:
         run_design_dir = workdir / run_id / "intermediate_designs_inverse_folded"
 
@@ -747,17 +752,17 @@ def submit_boltzgen_task(
     if not salvage_mode:
         # Find any file references in the yaml (path: something.cif)
         # File paths in yaml are relative to the yaml file location
-        print("Checking if input yaml references additional files...")
+        print("🧬 Checking if input yaml references additional files...")
         if input_yaml is None:
             raise ValueError("input_yaml must be provided for new BoltzGen runs.")
         yaml_path = Path(input_yaml)
         yml_parser = YAMLReferenceLoader(yaml_path)
         if yml_parser.additional_files:
             print(
-                f"Including additional referenced files: {list(yml_parser.additional_files.keys())}"
+                f"🧬 Including additional referenced files: {list(yml_parser.additional_files.keys())}"
             )
 
-        print(f"Submitting BoltzGen run for yaml: {input_yaml}")
+        print(f"🧬 Submitting BoltzGen run for yaml: {input_yaml}")
         yaml_str = yaml_path.read_bytes()
 
         prepare_boltzgen_run.remote(
@@ -766,9 +771,9 @@ def submit_boltzgen_task(
             additional_files=yml_parser.additional_files,
         )
     else:
-        print(f"Salvage mode enabled; skipping input preparation for {run_name}.")
+        print(f"🧬 Salvage mode enabled; skipping input preparation for {run_name}.")
 
-    print("Running BoltzGen...")
+    print("🧬 Running BoltzGen...")
     budget = min(budget, num_designs)
     outputs = collect_boltzgen_data.remote(
         run_name=run_name,
@@ -796,7 +801,7 @@ def submit_boltzgen_task(
             run_out_dir: Path = local_out_dir / "outputs" / run_id
             run_out_dir.mkdir(parents=True, exist_ok=True)
             remote_root_dir = f"{run_name}/outputs/{run_id}"
-            print(f"Downloading results for run ID {run_id}...")
+            print(f"🧬 Downloading results for run ID {run_id}...")
             for subdir in (
                 "boltzgen-run.log",
                 f"{run_name}.cif",
@@ -817,4 +822,4 @@ def submit_boltzgen_task(
                     cwd=run_out_dir,
                 )
 
-    print(f"Results saved to: {local_out_dir}")
+    print(f"🧬 Results saved to: {local_out_dir}")
